@@ -46,6 +46,15 @@ struct SemanticVersion: Comparable, Sendable {
     }
 }
 
+/// Where updates come from: sloper-ai's fork, whose repository is also its Homebrew tap.
+enum UpdateSource {
+    static let owner = "sloper-ai"
+    static let repo = "mac-runner"
+    /// Fully qualified, so `brew` upgrades from this tap and not from another tap that
+    /// has a `mac-runner` cask, such as upstream's `omniaura/tap`.
+    static let homebrewCask = "sloper-ai/mac-runner/mac-runner"
+}
+
 enum UpdateInstallSource: Sendable, Equatable {
     case homebrewFormula
     case homebrewCask
@@ -72,7 +81,7 @@ struct AvailableUpdate: Sendable, Equatable {
         case .homebrewFormula:
             return "brew upgrade mac-runner"
         case .homebrewCask:
-            return "brew upgrade --cask mac-runner"
+            return "brew upgrade --cask \(UpdateSource.homebrewCask)"
         case .directDownload:
             return nil
         }
@@ -83,9 +92,9 @@ struct AvailableUpdate: Sendable, Equatable {
         case .homebrewFormula:
             return "Runs brew upgrade mac-runner"
         case .homebrewCask:
-            return "Runs brew upgrade --cask mac-runner"
+            return "Runs brew upgrade --cask \(UpdateSource.homebrewCask)"
         case .directDownload:
-            return "Download the latest DMG from GitHub Releases"
+            return "Download the latest release from GitHub"
         }
     }
 }
@@ -131,8 +140,8 @@ final class UpdateChecker {
     init(
         userDefaults: UserDefaults = .standard,
         now: @escaping () -> Date = Date.init,
-        owner: String = "omniaura",
-        repo: String = "mac-runner",
+        owner: String = UpdateSource.owner,
+        repo: String = UpdateSource.repo,
         fetchLatestRelease: @escaping FetchLatestRelease = UpdateChecker.liveFetch
     ) {
         self.userDefaults = userDefaults
@@ -203,7 +212,9 @@ final class UpdateChecker {
             return .homebrewFormula
         }
 
-        if bundlePath.hasSuffix("/Mac Runner.app") {
+        // The cask installs MacRunner.app; "Mac Runner.app" is the app's display name.
+        let bundleName = URL(fileURLWithPath: bundlePath).lastPathComponent
+        if bundleName == "MacRunner.app" || bundleName == "Mac Runner.app" {
             let caskReceipts = [
                 "/opt/homebrew/Caskroom/mac-runner",
                 "/usr/local/Caskroom/mac-runner"
