@@ -1,3 +1,10 @@
+# [1.26.0](https://github.com/sloper-ai/mac-runner/compare/v1.25.1...v1.26.0) (2026-10-08)
+
+
+### Features
+
+* Docker engine, just-in-time runners and Docker-in-Docker ([#2](https://github.com/sloper-ai/mac-runner/issues/2)) ([81a3a8b](https://github.com/sloper-ai/mac-runner/commit/81a3a8b7d553241a1fa79e69f5f08a33c38d4b1e))
+
 ## [1.25.1](https://github.com/omniaura/mac-runner/compare/v1.25.0...v1.25.1) (2026-09-27)
 
 
