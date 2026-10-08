@@ -5,7 +5,8 @@ import Foundation
 /// Inputs arrive as `MR_*` environment variables rather than being spliced
 /// into the script, so names, labels, and tokens need no shell quoting.
 enum ContainerRunnerScript {
-    /// Where the host's `_work` and `_diag` directories are mounted.
+    /// Where the runner's work directory (the host's `_work`, or a Docker
+    /// volume) and the host's `_diag` directory are mounted.
     static let workMount = "/mac-runner/_work"
     static let diagnosticsMount = "/mac-runner/_diag"
 
@@ -153,8 +154,9 @@ enum ContainerRunnerScript {
     exec ./run.sh
     """#
 
-    /// X display for GUI-enabled container runners. Each runner has its own VM,
-    /// so every runner gets a separate display even though the name is shared.
+    /// X display for GUI-enabled container runners. Each runner has its own VM
+    /// or container, so every runner gets a separate display even though the
+    /// name is shared.
     static let displayName = ":99"
 
     /// DNS-safe hostname for a runner's container.
@@ -185,22 +187,46 @@ enum ContainerRunnerScript {
         return (packages.filter { seen.insert($0).inserted }, installGitHubCLI)
     }
 
-    static func environment(for config: ContainerRunnerConfiguration) -> [String] {
-        let apt = aptPackages(for: config.tools)
+    /// The script's inputs, in a fixed order: the container environment both
+    /// engines give it. Values are passed as they are, never through a shell.
+    static func variables(
+        registrationURL: String,
+        registrationToken: String,
+        runnerName: String,
+        labels: [String],
+        runnerDownloadURL: String,
+        openFileLimit: Int,
+        tools: [String],
+        enableGUI: Bool
+    ) -> [(name: String, value: String)] {
+        let apt = aptPackages(for: tools)
         return [
-            "RUNNER_ALLOW_RUNASROOT=1",
-            "MR_URL=\(config.repositoryURL)",
-            "MR_TOKEN=\(config.registrationToken)",
-            "MR_NAME=\(config.runnerName)",
-            "MR_LABELS=\(config.labels.joined(separator: ","))",
-            "MR_RUNNER_URL=\(config.runnerDownloadURL)",
-            "MR_OPEN_FILES=\(config.openFileLimit)",
-            "MR_WORK_DIR=\(workMount)",
-            "MR_DIAG_DIR=\(diagnosticsMount)",
-            "MR_APT_PACKAGES=\(apt.packages.joined(separator: " "))",
-            "MR_INSTALL_GH=\(apt.installGitHubCLI ? 1 : 0)",
-            "MR_ENABLE_GUI=\(config.enableGUI ? 1 : 0)",
-            "MR_DISPLAY=\(displayName)",
+            ("RUNNER_ALLOW_RUNASROOT", "1"),
+            ("MR_URL", registrationURL),
+            ("MR_TOKEN", registrationToken),
+            ("MR_NAME", runnerName),
+            ("MR_LABELS", labels.joined(separator: ",")),
+            ("MR_RUNNER_URL", runnerDownloadURL),
+            ("MR_OPEN_FILES", String(openFileLimit)),
+            ("MR_WORK_DIR", workMount),
+            ("MR_DIAG_DIR", diagnosticsMount),
+            ("MR_APT_PACKAGES", apt.packages.joined(separator: " ")),
+            ("MR_INSTALL_GH", apt.installGitHubCLI ? "1" : "0"),
+            ("MR_ENABLE_GUI", enableGUI ? "1" : "0"),
+            ("MR_DISPLAY", displayName),
         ]
+    }
+
+    static func environment(for config: ContainerRunnerConfiguration) -> [String] {
+        variables(
+            registrationURL: config.repositoryURL,
+            registrationToken: config.registrationToken,
+            runnerName: config.runnerName,
+            labels: config.labels,
+            runnerDownloadURL: config.runnerDownloadURL,
+            openFileLimit: config.openFileLimit,
+            tools: config.tools,
+            enableGUI: config.enableGUI
+        ).map { "\($0.name)=\($0.value)" }
     }
 }

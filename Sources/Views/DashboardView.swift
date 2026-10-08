@@ -326,10 +326,14 @@ struct RunnerDetailView: View {
 
         return DetailSection(title: "Configuration") {
             DetailRow("Scope", runner.scope.displayName)
-            DetailRow("Isolation", "\(isolation.icon) \(isolation.displayName)\(runner.isolationMode == nil ? " (global)" : "")")
+            DetailRow("Isolation", "\(isolation.icon) \(runner.isolationDisplayName(for: isolation))\(runner.isolationMode == nil ? " (global)" : "")")
             if isolation == .container {
                 DetailRow("Image", runner.containerImage ?? ContainerRunnerConfiguration.defaultRunnerImage)
                 DetailRow("Tools", (runner.containerTools ?? []).isEmpty ? "—" : (runner.containerTools ?? []).joined(separator: ", "))
+                DetailRow("Resources", runner.containerResourcesDescription)
+                if runner.effectiveContainerEngine == .docker {
+                    DetailRow("Work volume", DockerRunnerEngine.workVolumeName(for: runner.id))
+                }
             }
             DetailRow("Display", runner.enableGUI ? "GUI access" : "Headless")
             DetailRow("Labels", runner.labels.isEmpty ? "—" : runner.labels.joined(separator: ", "))

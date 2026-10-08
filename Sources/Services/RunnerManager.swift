@@ -465,7 +465,7 @@ class RunnerManager: ObservableObject {
         let ids = runnersToAutoRestart
         runnersToAutoRestart.removeAll()
 
-        for id in ids {
+        func restart(_ id: UUID) async {
             do {
                 try await startRunner(id)
             } catch {
@@ -473,6 +473,20 @@ class RunnerManager: ObservableObject {
                     runners[index].status = .error
                     saveConfiguration()
                 }
+            }
+        }
+
+        let dockerIDs = ids.filter { id in
+            runners.first(where: { $0.id == id })?.runsInDocker(global: currentSettings.isolationMode) == true
+        }
+        for id in ids.subtracting(dockerIDs) {
+            await restart(id)
+        }
+        if !dockerIDs.isEmpty {
+            // At login, Docker Desktop can take a while longer to start than we do.
+            _ = await DockerRunnerEngine.waitForDaemon(timeout: 120)
+            for id in dockerIDs {
+                await restart(id)
             }
         }
 
@@ -494,6 +508,10 @@ class RunnerManager: ObservableObject {
     ///   - isolationMode: Optional isolation mode override (nil uses global setting)
     ///   - enableGUI: Whether to enable GUI access for this runner (default: false, headless)
     ///   - openFileLimit: Optional max open file override (nil uses global setting)
+    ///   - containerImage: Container isolation: image to run (nil uses the default image)
+    ///   - containerEngine: Container isolation: engine to run it with (nil uses Apple's)
+    ///   - containerCPUs: Container isolation: CPUs for the container (nil uses the default)
+    ///   - containerMemoryMB: Container isolation: memory for the container, in MB (nil uses the default)
     /// - Throws: RunnerError if validation or setup fails
     func addRunner(
         name: String,
@@ -503,7 +521,10 @@ class RunnerManager: ObservableObject {
         isolationMode: IsolationMode? = nil,
         enableGUI: Bool = false,
         openFileLimit: Int? = nil,
-        containerImage: String? = nil
+        containerImage: String? = nil,
+        containerEngine: ContainerEngine? = nil,
+        containerCPUs: Int? = nil,
+        containerMemoryMB: Int? = nil
     ) async throws {
         isLoading = true
         defer { isLoading = false }
@@ -524,6 +545,13 @@ class RunnerManager: ObservableObject {
         let target = runner.target
         if effectiveIsolation == .container {
             runner.containerImage = containerImage.flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+            runner.containerEngine = containerEngine
+            runner.containerCPUs = containerCPUs
+            runner.containerMemoryMB = containerMemoryMB
+        }
+        if runner.runsInDocker(global: currentSettings.isolationMode) {
+            // Fail before anything is registered or saved.
+            _ = try await DockerRunnerEngine.requireRunningDaemon()
         }
 
         try await toolProvisioningService.ensureGitHubCLI(isolation: effectiveIsolation)
@@ -623,6 +651,11 @@ class RunnerManager: ObservableObject {
         // it behind strands storage that nothing will ever reference again.
         if let runner = runners.first(where: { $0.id == id }) {
             let isolation = runner.effectiveIsolationMode(global: currentSettings.isolationMode)
+            if isolation == .container {
+                // On Docker, _work is a volume. Checked whatever the engine, in
+                // case the runner used Docker before it switched.
+                await DockerRunnerEngine.removeContainerAndWorkVolume(for: id)
+            }
             do {
                 try RunnerDirectory.remove(for: id, isolation: isolation)
             } catch {
@@ -652,8 +685,9 @@ class RunnerManager: ObservableObject {
     /// Start a runner and begin accepting GitHub Actions workflow jobs.
     ///
     /// Launches the runner using the appropriate isolation mode (none, dedicated user, or container).
-    /// For container isolation, creates and starts a Linux container. For process-based isolation,
-    /// launches the runner as a background process. Updates the runner's status to running.
+    /// For container isolation, creates and starts a Linux container: in a VM hosted by this
+    /// process (Apple's engine), or with a background `docker run` (Docker). For process-based
+    /// isolation, launches the runner as a background process. Updates the runner's status to running.
     ///
     /// - Parameter id: UUID of the runner to start
     /// - Throws: RunnerError if the runner is not found, already running, or if startup fails
@@ -703,8 +737,52 @@ class RunnerManager: ObservableObject {
         // Launch runner as a background process that survives the parent (CLI) exiting.
         let logFile = "\(runnerDir)/runner.log"
 
-        // Container isolation requires special handling
-        if case .container = isolation {
+        if usesDocker(runner) {
+            // Docker: the launcher runs `docker run` as a background process.
+            try await validateGitHubAuth(for: runner, operation: "start runner")
+            let (docker, daemon) = try await DockerRunnerEngine.requireRunningDaemon()
+            let cpus = try DockerRunnerEngine.cpus(for: runner, dockerCPUs: daemon.cpuCount)
+            let registrationToken = try await ghService.getRegistrationToken(for: runner.target)
+            let runnerVersion = await RunnerInstaller.shared.resolveRunnerVersion()
+            let openFileLimit = runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit)
+            let variables = ContainerRunnerScript.variables(
+                registrationURL: runner.target.registrationURL,
+                registrationToken: registrationToken,
+                runnerName: runner.name,
+                labels: runner.labels,
+                runnerDownloadURL: RunnerInstaller.linuxDownloadURL(version: runnerVersion),
+                openFileLimit: openFileLimit,
+                tools: runner.containerTools ?? [],
+                enableGUI: runner.enableGUI
+            ) + DockerRunnerEngine.engineVariables
+
+            _ = try Self.makeDirectory(runnerDir, "_diag")
+            let launcher = try DockerRunnerEngine.writeLaunchFiles(
+                docker: docker,
+                runnerID: id,
+                runnerName: runner.name,
+                runnerDirectory: runnerDir,
+                image: runner.containerImage ?? ContainerRunnerConfiguration.defaultRunnerImage,
+                cpus: cpus,
+                memoryMB: runner.effectiveContainerMemoryMB,
+                openFileLimit: openFileLimit,
+                environmentNames: variables.map(\.name)
+            )
+            let process = try processManager.startProcess(
+                for: id,
+                executable: launcher,
+                workingDirectory: runnerDir,
+                logFile: logFile,
+                isolation: isolation,
+                enableGUI: runner.enableGUI,
+                openFileLimit: openFileLimit,
+                // The token reaches the container through the environment only.
+                extraEnvironment: Dictionary(variables.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last })
+            )
+            track(process, for: id, launchToken: launchToken)
+            recordGitHubRunnerIDOnceOnline(id)
+        } else if case .container = isolation {
+            // Container isolation requires special handling
             try await validateGitHubAuth(for: runner, operation: "start runner")
             // Container-based isolation (macOS 26+)
             #if canImport(Containerization)
@@ -728,10 +806,11 @@ class RunnerManager: ObservableObject {
                 // `config.sh --url` inside the container, so it must point at the org or
                 // repo depending on the runner's scope.
                 let runnerVersion = await RunnerInstaller.shared.resolveRunnerVersion()
+                let resources = ContainerRunnerConfiguration.resources(for: runner)
                 let containerConfig = ContainerRunnerConfiguration(
                     containerImage: runner.containerImage,
-                    cpuCount: 2,
-                    memoryInBytes: 4 * 1024 * 1024 * 1024,  // 4 GiB
+                    cpuCount: resources.cpuCount,  // default 2
+                    memoryInBytes: resources.memoryInBytes,  // default 4 GiB
                     diskSizeInBytes: 16 * 1024 * 1024 * 1024,  // 16 GiB (sparse)
                     enableNestedVirtualization: false,
                     // Mount only _work and _diag, so runner.log and diagnostics sit
@@ -808,23 +887,7 @@ class RunnerManager: ObservableObject {
                 enableGUI: runner.enableGUI,
                 openFileLimit: runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit)
             )
-
-            // Store process reference for in-memory tracking (GUI)
-            runnerProcesses[id] = process
-            launchTokens[id] = launchToken
-
-            process.terminationHandler = { [weak self] terminatedProcess in
-                Task { @MainActor [weak self] in
-                    self?.handleRunnerTermination(
-                        id,
-                        launchToken: launchToken,
-                        cause: .process(
-                            reason: terminatedProcess.terminationReason,
-                            status: terminatedProcess.terminationStatus
-                        )
-                    )
-                }
-            }
+            track(process, for: id, launchToken: launchToken)
         }
 
         // The runner list can be replaced while we awaited (e.g. a config
@@ -847,6 +910,7 @@ class RunnerManager: ObservableObject {
     ///
     /// For container-based runners, stops and deletes the container. For process-based runners,
     /// terminates the process tree using the appropriate method for the isolation mode.
+    /// Docker runners are stopped like processes, then their container is removed.
     /// Updates the runner's status to stopped.
     ///
     /// - Parameter id: UUID of the runner to stop
@@ -864,7 +928,9 @@ class RunnerManager: ObservableObject {
 
         // Check if this is a container-based runner
         do {
-            if case .container = isolation {
+            if usesDocker(runner) {
+                try await stopDockerRunner(id, isolation: isolation)
+            } else if case .container = isolation {
                 #if canImport(Containerization)
                 if #available(macOS 26.0, *) {
                     if let container = runnerContainers[id] {
@@ -1173,15 +1239,25 @@ class RunnerManager: ObservableObject {
             let directory: String
         }
         var containerIDs: Set<UUID> = []
+        var dockerContainers: [UUID: String] = [:]
         let targets: [Target] = runners.filter { $0.status == .running }.map { runner in
             let isolation = runner.effectiveIsolationMode(global: currentSettings.isolationMode)
             let directory = RunnerDirectory.directoryURL(for: runner.id, isolation: isolation).path
+            if usesDocker(runner) {
+                // Its launcher's process tree is just the docker CLI; Docker reports the container.
+                dockerContainers[runner.id] = DockerRunnerEngine.containerName(for: runner.id)
+                return Target(id: runner.id, pid: nil, directory: directory)
+            }
             if isolation == .container {
                 containerIDs.insert(runner.id)
                 return Target(id: runner.id, pid: nil, directory: directory)
             }
             let pid = runnerProcesses[runner.id]?.processIdentifier ?? pidManager.readPID(for: runner.id)
             return Target(id: runner.id, pid: pid, directory: directory)
+        }
+        let docker = dockerContainers.isEmpty ? nil : DockerRunnerEngine.executablePath()
+        let dockerVolumes = dockerContainers.keys.reduce(into: [UUID: String]()) { volumes, id in
+            volumes[id] = DockerRunnerEngine.workVolumeName(for: id)
         }
 
         let wantsDisk = measureDisk || lastDiskMeasurement.map { now.timeIntervalSince($0) >= 300 } ?? true
@@ -1190,7 +1266,17 @@ class RunnerManager: ObservableObject {
             isMeasuringDisk = true
             let measure = Task { [weak self] in
                 let sizes = await Task.detached(priority: .background) {
-                    targets.map { ($0.id, ResourceMonitor.directorySize($0.directory)) }
+                    // A Docker runner's _work is a volume, measured by Docker.
+                    let volumeSizes = docker.flatMap { ResourceMonitor.dockerVolumeSizes(docker: $0) }
+                    return targets.map { target -> (UUID, ResourceMonitor.DiskMeasurement?) in
+                        let size = ResourceMonitor.directorySize(target.directory)
+                        guard let volume = dockerVolumes[target.id] else { return (target.id, size) }
+                        let volumeSize = volumeSizes?[volume]
+                        return (target.id, ResourceMonitor.DiskMeasurement(
+                            bytes: (size?.bytes ?? 0) + (volumeSize ?? 0),
+                            isComplete: size?.isComplete == true && volumeSize != nil
+                        ))
+                    }
                 }.value
                 await MainActor.run {
                     guard let self else { return }
@@ -1211,6 +1297,9 @@ class RunnerManager: ObservableObject {
                 (target.id, target.pid.map { ResourceMonitor.usage(ofProcessTree: $0) } ?? .zero)
             }
         }.value
+        let dockerUsage: [String: RunnerResourceUsage] = await Task.detached(priority: .utility) {
+            docker.flatMap { ResourceMonitor.dockerContainerUsage(docker: $0) } ?? [:]
+        }.value
 
         var usage: [UUID: RunnerResourceUsage] = [:]
         for (id, sample) in sampled {
@@ -1218,6 +1307,10 @@ class RunnerManager: ObservableObject {
             if containerIDs.contains(id) {
                 // Nil when the container runs in another process: shown without numbers.
                 guard let containerSample = await containerUsage(for: id, now: now) else { continue }
+                entry = containerSample
+            } else if let container = dockerContainers[id] {
+                // Missing until the container is up (e.g. while its image is pulled).
+                guard let containerSample = dockerUsage[container] else { continue }
                 entry = containerSample
             }
             usage[id] = entry
@@ -1396,7 +1489,7 @@ class RunnerManager: ObservableObject {
             default: continue
             }
             do {
-                try await preflightRegistration(desired)
+                try await preflightRegistration(desired, settings: settings)
             } catch {
                 fail(index, error)
             }
@@ -1460,29 +1553,51 @@ class RunnerManager: ObservableObject {
     /// Apply an in-place update; returns a note when a restart was deferred.
     private func update(_ runner: Runner, to desired: DesiredRunner, restart: Bool) async throws -> String? {
         guard let index = runners.firstIndex(where: { $0.id == runner.id }) else { throw RunnerError.notFound }
+        // A runner is stopped the way its engine started it, so a running one
+        // switches engine only once it has stopped.
+        let wantedEngine = desired.containerEngine ?? .apple
+        let switchesEngine = runners[index].effectiveContainerEngine != wantedEngine
+        if switchesEngine && restart && wantedEngine == .docker {
+            // Don't stop it for an engine that can't start it.
+            _ = try await DockerRunnerEngine.requireRunningDaemon()
+        }
         runners[index].isolationMode = desired.isolation
         runners[index].enableGUI = desired.enableGUI
         runners[index].openFileLimit = desired.openFileLimit
         runners[index].quietHours = desired.quietHours
         runners[index].containerImage = desired.containerImage
+        runners[index].containerCPUs = desired.containerCPUs
+        runners[index].containerMemoryMB = desired.containerMemoryMB
+        if !(switchesEngine && restart) {
+            runners[index].containerEngine = desired.containerEngine
+        }
         saveConfiguration()
         guard restart else { return nil }
 
         // Don't interrupt a job; the change applies the next time the runner starts.
         if let remote = try? await ghService.listRemoteRunners(for: runner.target),
            remote.first(where: { $0.name == runner.name })?.busy == true {
-            return "restart deferred: a job is running (takes effect when the runner next starts)"
+            return switchesEngine
+                ? "engine change deferred: a job is running (run `mac-runner apply` again once it's idle)"
+                : "restart deferred: a job is running (takes effect when the runner next starts)"
         }
         try await stopRunner(runner.id)
+        if switchesEngine, let index = runners.firstIndex(where: { $0.id == runner.id }) {
+            runners[index].containerEngine = desired.containerEngine
+            saveConfiguration()
+        }
         try await startRunner(runner.id)
         return nil
     }
 
     /// Fail early, before anything is removed, if a runner couldn't be registered.
-    private func preflightRegistration(_ desired: DesiredRunner) async throws {
+    private func preflightRegistration(_ desired: DesiredRunner, settings: AppSettings) async throws {
         let auth = await ghService.validateAuth()
         guard auth.isAuthenticated else { throw GHError.authFailed(auth.recoveryMessage) }
         guard try await ghService.validateTarget(desired.target) else { throw RunnerError.invalidRepo }
+        if (desired.isolation ?? settings.isolationMode) == .container, desired.containerEngine == .docker {
+            _ = try await DockerRunnerEngine.requireRunningDaemon()
+        }
     }
 
     private func addRunner(_ desired: DesiredRunner) async throws {
@@ -1494,7 +1609,10 @@ class RunnerManager: ObservableObject {
             isolationMode: desired.isolation,
             enableGUI: desired.enableGUI,
             openFileLimit: desired.openFileLimit,
-            containerImage: desired.containerImage
+            containerImage: desired.containerImage,
+            containerEngine: desired.containerEngine,
+            containerCPUs: desired.containerCPUs,
+            containerMemoryMB: desired.containerMemoryMB
         )
         if let quietHours = desired.quietHours, let runner = runner(named: desired.name) {
             setQuietHours(quietHours, for: runner.id)
@@ -1503,7 +1621,8 @@ class RunnerManager: ObservableObject {
 
     // MARK: - Container Runners
 
-    /// Container runners whose VM runs in this process.
+    /// Container runners whose VM runs in this process. (Docker runners run in
+    /// the background on their own, like runners without isolation.)
     var hostedContainerRunnerIDs: [UUID] {
         Array(runnerContainers.keys)
     }
@@ -1517,8 +1636,8 @@ class RunnerManager: ObservableObject {
         remote.first { $0.name == name && $0.status == "offline" }
     }
 
-    /// A container runner registers from inside its VM; remember its GitHub ID
-    /// once it's online so removal can deregister exactly that runner.
+    /// A container runner registers from inside its container; remember its
+    /// GitHub ID once it's online so removal can deregister exactly that runner.
     private func recordGitHubRunnerIDOnceOnline(_ id: UUID) {
         Task { [weak self] in
             for _ in 0..<24 {
@@ -1526,7 +1645,7 @@ class RunnerManager: ObservableObject {
                 guard let self,
                       let runner = self.runners.first(where: { $0.id == id }),
                       runner.status == .running,
-                      self.runnerContainers[id] != nil else { return }
+                      self.runnerContainers[id] != nil || self.runnerProcesses[id] != nil else { return }
                 if let remote = try? await self.ghService.listRemoteRunners(for: runner.target),
                    let match = remote.first(where: { $0.name == runner.name && $0.status == "online" }),
                    let index = self.runners.firstIndex(where: { $0.id == id }) {
@@ -1538,6 +1657,44 @@ class RunnerManager: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Docker Runners
+
+    /// Whether `runner` runs (or will run) on Docker. What this process is
+    /// running decides over the config: a VM hosted here stops as an Apple VM,
+    /// and a launcher started here as a Docker runner.
+    private func usesDocker(_ runner: Runner) -> Bool {
+        guard runner.effectiveIsolationMode(global: currentSettings.isolationMode) == .container else { return false }
+        if runnerContainers[runner.id] != nil { return false }
+        if runnerProcesses[runner.id] != nil { return true }
+        return runner.effectiveContainerEngine == .docker
+    }
+
+    /// Stop a Docker runner like any runner process: docker passes the signal
+    /// on, and the listener signs off from GitHub. It gets a few seconds to
+    /// exit; then its container is removed, in case it outlived the launcher.
+    private func stopDockerRunner(_ id: UUID, isolation: IsolationMode) async throws {
+        let inMemoryProcess = runnerProcesses[id]
+        let pid = inMemoryProcess?.processIdentifier ?? pidManager.readPID(for: id)
+        do {
+            try processManager.stopProcess(for: id, isolation: isolation, inMemoryProcess: inMemoryProcess)
+        } catch {
+            // Nothing to signal, but a container can still be left behind.
+            await DockerRunnerEngine.removeContainer(for: id)
+            throw error
+        }
+        if inMemoryProcess != nil {
+            runnerProcesses.removeValue(forKey: id)
+        }
+
+        let deadline = Date().addingTimeInterval(DockerRunnerEngine.stopGracePeriod)
+        while Date() < deadline {
+            let exited = inMemoryProcess.map { !$0.isRunning } ?? pid.map { !pidManager.isProcessAlive($0) } ?? true
+            if exited { break }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        await DockerRunnerEngine.removeContainer(for: id)
     }
 
     // MARK: - Lookup
@@ -1597,6 +1754,21 @@ class RunnerManager: ObservableObject {
             // Fetch remote runner status from GitHub
             guard let remoteRunners = try? await ghService.listRemoteRunners(for: target) else {
                 continue
+            }
+
+            // A Docker runner registers from inside its container and can outlive
+            // the process that started it (a CLI, say): note its ID once it's online.
+            var recordedRunnerIDs = false
+            for runner in runningRunners where runner.githubRunnerId == nil
+                && runner.runsInDocker(global: currentSettings.isolationMode) {
+                if let match = remoteRunners.first(where: { $0.name == runner.name && $0.status == "online" }),
+                   let index = runners.firstIndex(where: { $0.id == runner.id }) {
+                    runners[index].githubRunnerId = match.id
+                    recordedRunnerIDs = true
+                }
+            }
+            if recordedRunnerIDs {
+                saveConfiguration()
             }
 
             // Update busy status for each runner
@@ -1772,7 +1944,10 @@ class RunnerManager: ObservableObject {
             isolationMode: originalRunner.isolationMode,
             enableGUI: originalRunner.enableGUI,
             openFileLimit: originalRunner.openFileLimit,
-            containerImage: originalRunner.containerImage
+            containerImage: originalRunner.containerImage,
+            containerEngine: originalRunner.containerEngine,
+            containerCPUs: originalRunner.containerCPUs,
+            containerMemoryMB: originalRunner.containerMemoryMB
         )
     }
 
@@ -1793,6 +1968,8 @@ class RunnerManager: ObservableObject {
     ///   - isolationMode: Optional isolation mode override
     ///   - enableGUI: Whether to enable GUI access
     ///   - openFileLimit: Optional max open file override
+    ///   - containerImage, containerEngine, containerCPUs, containerMemoryMB: Container
+    ///     isolation settings, as for `addRunner`
     ///   - onProgress: Called after each runner is created with (completed, total)
     /// - Throws: RunnerError if validation or setup fails for any runner
     func addRunners(
@@ -1805,6 +1982,9 @@ class RunnerManager: ObservableObject {
         enableGUI: Bool = false,
         openFileLimit: Int? = nil,
         containerImage: String? = nil,
+        containerEngine: ContainerEngine? = nil,
+        containerCPUs: Int? = nil,
+        containerMemoryMB: Int? = nil,
         onProgress: ((Int, Int) -> Void)? = nil
     ) async throws {
         guard count >= 1 else { return }
@@ -1819,7 +1999,10 @@ class RunnerManager: ObservableObject {
                 isolationMode: isolationMode,
                 enableGUI: enableGUI,
                 openFileLimit: openFileLimit,
-                containerImage: containerImage
+                containerImage: containerImage,
+                containerEngine: containerEngine,
+                containerCPUs: containerCPUs,
+                containerMemoryMB: containerMemoryMB
             )
             onProgress?(1, 1)
             return
@@ -1853,7 +2036,10 @@ class RunnerManager: ObservableObject {
                     isolationMode: isolationMode,
                     enableGUI: enableGUI,
                     openFileLimit: openFileLimit,
-                    containerImage: containerImage
+                    containerImage: containerImage,
+                    containerEngine: containerEngine,
+                    containerCPUs: containerCPUs,
+                    containerMemoryMB: containerMemoryMB
                 )
             } catch {
                 errors.append((name: name, error: error))
@@ -1895,6 +2081,25 @@ class RunnerManager: ObservableObject {
                 return "container exit code \(status)"
             case .monitoringError(let message):
                 return "monitoring error: \(message)"
+            }
+        }
+    }
+
+    /// Keep a runner's process for in-memory tracking (GUI) and handle its exit.
+    private func track(_ process: Process, for id: UUID, launchToken: UUID) {
+        runnerProcesses[id] = process
+        launchTokens[id] = launchToken
+
+        process.terminationHandler = { [weak self] terminatedProcess in
+            Task { @MainActor [weak self] in
+                self?.handleRunnerTermination(
+                    id,
+                    launchToken: launchToken,
+                    cause: .process(
+                        reason: terminatedProcess.terminationReason,
+                        status: terminatedProcess.terminationStatus
+                    )
+                )
             }
         }
     }
@@ -2437,6 +2642,9 @@ enum RunnerError: LocalizedError {
     case containerServiceNotAvailable
     case bulkCreationPartialFailure(succeeded: Int, failed: Int, details: String)
     case containerHostedElsewhere(pid: pid_t)
+    case dockerNotFound
+    case dockerNotRunning
+    case dockerHasTooFewCPUs(requested: Int, available: Int)
 
     var errorDescription: String? {
         switch self {
@@ -2451,6 +2659,12 @@ enum RunnerError: LocalizedError {
             return "Bulk creation: \(succeeded) succeeded, \(failed) failed (\(details))"
         case .containerHostedElsewhere(let pid):
             return "This container runner's VM runs inside another Mac Runner process (pid \(pid)). Stop it there: Ctrl-C in that terminal, or the menu bar app."
+        case .dockerNotFound:
+            return "Docker isn't installed: the Docker engine needs the docker CLI (Docker Desktop, OrbStack, or Colima)"
+        case .dockerNotRunning:
+            return "Docker is not running. Start Docker Desktop (or OrbStack, Colima) and try again."
+        case .dockerHasTooFewCPUs(let requested, let available):
+            return "This runner asks for \(requested) CPUs, but Docker has \(available). Give Docker more CPUs (e.g. Docker Desktop → Settings → Resources) or lower the runner's CPUs."
         }
     }
 }

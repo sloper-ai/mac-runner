@@ -48,7 +48,9 @@ struct RunnerResourceUsage: Sendable, Equatable {
 }
 
 /// Samples runner process trees with `ps` (which also reports processes owned
-/// by a dedicated service user) and measures workspaces with `du`.
+/// by a dedicated service user) and measures workspaces with `du`. Docker
+/// runners are sampled with `docker stats`, and their work volumes measured
+/// with `docker system df`.
 enum ResourceMonitor {
     struct ProcessSample: Equatable {
         var cpuPercent: Double
@@ -123,6 +125,100 @@ enum ResourceMonitor {
     static func cpuPercent(previousUsec: UInt64, currentUsec: UInt64, elapsed: TimeInterval) -> Double {
         guard elapsed > 0, currentUsec >= previousUsec else { return 0 }
         return Double(currentUsec - previousUsec) / (elapsed * 1_000_000) * 100
+    }
+
+    // MARK: - Docker
+
+    static let dockerStatsFormat = "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}"
+
+    /// CPU, memory, and process count of each running container, by name;
+    /// nil when Docker can't be asked.
+    static func dockerContainerUsage(docker: String, timeout: TimeInterval = 15) -> [String: RunnerResourceUsage]? {
+        guard let result = try? ProcessExecutor.run(
+            docker,
+            arguments: ["stats", "--no-stream", "--format", dockerStatsFormat],
+            timeout: timeout
+        ), result.succeeded else {
+            return nil
+        }
+        return parseDockerStats(result.output)
+    }
+
+    /// Parses `docker stats --no-stream --format dockerStatsFormat` output,
+    /// e.g. "mac-runner-…\t12.5%\t1.2GiB / 7.6GiB\t42". Containers still
+    /// starting report "--" and are left out.
+    static func parseDockerStats(_ output: String) -> [String: RunnerResourceUsage] {
+        var usage: [String: RunnerResourceUsage] = [:]
+        for line in output.split(separator: "\n") {
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard fields.count >= 4,
+                  let cpu = Double(fields[1].replacingOccurrences(of: "%", with: "")),
+                  let memory = parseDockerByteCount(fields[2].components(separatedBy: "/")[0]) else { continue }
+            usage[fields[0]] = RunnerResourceUsage(
+                cpuPercent: cpu,
+                memoryBytes: memory,
+                processCount: Int(fields[3]) ?? 0,
+                diskBytes: nil
+            )
+        }
+        return usage
+    }
+
+    /// Size of each Docker volume, by name; nil when Docker can't be asked.
+    /// `docker system df` measures every volume, so call it as rarely as `du`.
+    static func dockerVolumeSizes(docker: String, timeout: TimeInterval = 120) -> [String: UInt64]? {
+        guard let result = try? ProcessExecutor.run(
+            docker,
+            arguments: ["system", "df", "-v", "--format", "{{json .Volumes}}"],
+            timeout: timeout
+        ), result.succeeded else {
+            return nil
+        }
+        return parseDockerVolumeSizes(result.output)
+    }
+
+    /// Parses `docker system df -v --format '{{json .Volumes}}'` output: a
+    /// JSON array of volumes whose sizes are strings like "474.2MB".
+    static func parseDockerVolumeSizes(_ output: String) -> [String: UInt64] {
+        struct Volume: Decodable {
+            let name: String
+            let size: String
+
+            enum CodingKeys: String, CodingKey {
+                case name = "Name"
+                case size = "Size"
+            }
+        }
+
+        // Warnings, if any, come before the JSON.
+        guard let json = output.split(separator: "\n").last(where: { $0.hasPrefix("[") }),
+              let volumes = try? JSONDecoder().decode([Volume].self, from: Data(json.utf8)) else {
+            return [:]
+        }
+        var sizes: [String: UInt64] = [:]
+        for volume in volumes {
+            sizes[volume.name] = parseDockerByteCount(volume.size)
+        }
+        return sizes
+    }
+
+    /// Bytes in a size as docker prints it: binary units in `docker stats`
+    /// ("1.5GiB"), decimal ones in `docker system df` ("474.2MB").
+    static func parseDockerByteCount(_ text: String) -> UInt64? {
+        let multipliers: [String: Double] = [
+            "b": 1,
+            "kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12, "pb": 1e15,
+            "kib": 1024, "mib": 1024 * 1024, "gib": 1024 * 1024 * 1024,
+            "tib": 1024 * 1024 * 1024 * 1024, "pib": 1024 * 1024 * 1024 * 1024 * 1024,
+        ]
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard let unitStart = trimmed.firstIndex(where: \.isLetter),
+              let value = Double(trimmed[..<unitStart]), value >= 0,
+              let multiplier = multipliers[trimmed[unitStart...].lowercased()] else {
+            return nil
+        }
+        return UInt64((value * multiplier).rounded())
     }
 }
 

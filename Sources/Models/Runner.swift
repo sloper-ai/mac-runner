@@ -42,6 +42,12 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     /// Container isolation: tools chosen when the runner was created, installed
     /// each time its container starts.
     var containerTools: [String]?
+    /// Container isolation: the engine that runs the container (nil = `.apple`).
+    var containerEngine: ContainerEngine?
+    /// Container isolation: CPUs and memory (in MB) for the container
+    /// (nil = `ResourceLimits.defaultContainerCPUs` and `defaultContainerMemoryMB`).
+    var containerCPUs: Int?
+    var containerMemoryMB: Int?
 
     init(
         id: UUID = UUID(),
@@ -58,7 +64,10 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         lastRestartEvent: String? = nil,
         openFileLimit: Int? = nil,
         quietHours: QuietHours? = nil,
-        autoPauseReason: AutoPauseReason? = nil
+        autoPauseReason: AutoPauseReason? = nil,
+        containerEngine: ContainerEngine? = nil,
+        containerCPUs: Int? = nil,
+        containerMemoryMB: Int? = nil
     ) {
         self.id = id
         self.name = name
@@ -75,6 +84,9 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         self.openFileLimit = ResourceLimits.normalizedOpenFileLimit(openFileLimit)
         self.quietHours = quietHours
         self.autoPauseReason = autoPauseReason
+        self.containerEngine = containerEngine
+        self.containerCPUs = containerCPUs
+        self.containerMemoryMB = containerMemoryMB
     }
 
     init(from decoder: Decoder) throws {
@@ -104,6 +116,10 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         autoPauseOverride = try container.decodeIfPresent(AutoPauseReason.self, forKey: .autoPauseOverride)
         containerImage = try container.decodeIfPresent(String.self, forKey: .containerImage)
         containerTools = try container.decodeIfPresent([String].self, forKey: .containerTools)
+        // Configs written before the Docker engine existed have Apple's (nil).
+        containerEngine = try container.decodeIfPresent(ContainerEngine.self, forKey: .containerEngine)
+        containerCPUs = try container.decodeIfPresent(Int.self, forKey: .containerCPUs)
+        containerMemoryMB = try container.decodeIfPresent(Int.self, forKey: .containerMemoryMB)
     }
 
     /// User-editable settings, compared when reconciling concurrent config edits.
@@ -120,6 +136,9 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         var quietHours: QuietHours?
         var containerImage: String?
         var containerTools: [String]?
+        var containerEngine: ContainerEngine?
+        var containerCPUs: Int?
+        var containerMemoryMB: Int?
     }
 
     var configuration: Configuration {
@@ -128,7 +147,9 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
                 name: name, repo: repo, scope: scope, labels: labels, enabled: enabled,
                 githubRunnerId: githubRunnerId, isolationMode: isolationMode, enableGUI: enableGUI,
                 openFileLimit: openFileLimit, quietHours: quietHours,
-                containerImage: containerImage, containerTools: containerTools
+                containerImage: containerImage, containerTools: containerTools,
+                containerEngine: containerEngine,
+                containerCPUs: containerCPUs, containerMemoryMB: containerMemoryMB
             )
         }
         set {
@@ -144,6 +165,9 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
             quietHours = newValue.quietHours
             containerImage = newValue.containerImage
             containerTools = newValue.containerTools
+            containerEngine = newValue.containerEngine
+            containerCPUs = newValue.containerCPUs
+            containerMemoryMB = newValue.containerMemoryMB
         }
     }
 
@@ -184,6 +208,47 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     /// - Returns: The isolation mode to use for this runner.
     func effectiveIsolationMode(global globalMode: IsolationMode) -> IsolationMode {
         return isolationMode ?? globalMode
+    }
+
+    /// The engine that runs this runner's container: its own, else Apple's.
+    var effectiveContainerEngine: ContainerEngine {
+        containerEngine ?? .apple
+    }
+
+    /// Whether this runner runs in Docker: container isolation on the Docker engine.
+    func runsInDocker(global globalMode: IsolationMode) -> Bool {
+        effectiveIsolationMode(global: globalMode) == .container && effectiveContainerEngine == .docker
+    }
+
+    /// `isolation`'s name as shown for this runner: container runners on
+    /// Docker name their engine, e.g. "Container (Docker)".
+    func isolationDisplayName(for isolation: IsolationMode) -> String {
+        guard isolation == .container, effectiveContainerEngine == .docker else { return isolation.displayName }
+        return "\(isolation.displayName) (\(ContainerEngine.docker.displayName))"
+    }
+
+    /// CPUs the runner's container gets: its own count, else the default.
+    var effectiveContainerCPUs: Int {
+        containerCPUs ?? ResourceLimits.defaultContainerCPUs
+    }
+
+    /// Memory the runner's container gets, in MB: its own, else the default.
+    var effectiveContainerMemoryMB: Int {
+        containerMemoryMB ?? ResourceLimits.defaultContainerMemoryMB
+    }
+
+    /// The container's CPUs and memory, e.g. "4 CPUs, 8 GB".
+    var containerResourcesDescription: String {
+        let cpus = effectiveContainerCPUs == 1 ? "1 CPU" : "\(effectiveContainerCPUs) CPUs"
+        return "\(cpus), \(ResourceLimits.memoryDescription(megabytes: effectiveContainerMemoryMB))"
+    }
+
+    /// `containerResourcesDescription` when either differs from the default;
+    /// nil otherwise.
+    var containerResourcesSummary: String? {
+        guard effectiveContainerCPUs != ResourceLimits.defaultContainerCPUs
+                || effectiveContainerMemoryMB != ResourceLimits.defaultContainerMemoryMB else { return nil }
+        return containerResourcesDescription
     }
 
     func effectiveOpenFileLimit(global globalLimit: Int) -> Int {
@@ -267,7 +332,7 @@ struct RunnerConfig: Codable, Sendable, Equatable {
 enum IsolationMode: Codable, Sendable, Equatable {
     case none
     case dedicatedUser(username: String)
-    case container  // Container isolation via Apple Containerization framework (macOS 26+)
+    case container  // Linux container isolation; each runner's `ContainerEngine` runs it
 
     static let defaultUsername = "_macrunner"
 
@@ -323,6 +388,24 @@ enum IsolationMode: Codable, Sendable, Equatable {
             return "👤"
         case .container:
             return "📦"
+        }
+    }
+}
+
+/// What runs a container-isolated runner's Linux container.
+enum ContainerEngine: String, Codable, Sendable, CaseIterable {
+    /// Apple's Containerization framework: a lightweight VM per runner, hosted
+    /// by the Mac Runner process that started it (macOS 26+, Apple Silicon).
+    case apple
+    /// A Docker container (Docker Desktop, OrbStack, Colima, …), run by a
+    /// background `docker run` that outlives the process that started it. The
+    /// work directory is a Docker volume, and images can be local.
+    case docker
+
+    var displayName: String {
+        switch self {
+        case .apple: return "Apple"
+        case .docker: return "Docker"
         }
     }
 }

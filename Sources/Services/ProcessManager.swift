@@ -17,6 +17,9 @@ class ProcessManager {
     ///   - isolation: Isolation mode to use
     ///   - enableGUI: Whether to enable GUI access (default: false, headless)
     ///   - openFileLimit: Maximum open file limit to apply before launch
+    ///   - extraEnvironment: Variables added to the process's environment for
+    ///     `.none` and `.container` (e.g. a Docker runner's registration token).
+    ///     They're only ever passed to the process, never written to disk.
     /// - Returns: The launched Process object
     /// - Throws: Error if process launch or PID write fails
     func startProcess(
@@ -26,7 +29,8 @@ class ProcessManager {
         logFile: String,
         isolation: IsolationMode,
         enableGUI: Bool = false,
-        openFileLimit: Int
+        openFileLimit: Int,
+        extraEnvironment: [String: String] = [:]
     ) throws -> Process {
         let process: Process
 
@@ -50,8 +54,9 @@ class ProcessManager {
             proc.standardError = logHandle
 
             let env = RunnerEnvironment.environment(enableGUI: enableGUI)
+            // The snapshot records PATH only, and from before the extra variables.
             try RunnerEnvironment.writePathSnapshot(in: workingDirectory, environment: env)
-            proc.environment = env
+            proc.environment = env.merging(extraEnvironment) { _, extra in extra }
 
             do {
                 try proc.run()

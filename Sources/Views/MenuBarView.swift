@@ -363,7 +363,7 @@ struct RunnerRow: View {
                 FlowLayout(spacing: 4) {
                     // Isolation mode indicator
                     if let mode = runner.isolationMode {
-                        Text("\(mode.icon) \(mode.displayName)")
+                        Text("\(mode.icon) \(runner.isolationDisplayName(for: mode))")
                             .font(.caption2)
                             .lineLimit(1)
                             .fixedSize()

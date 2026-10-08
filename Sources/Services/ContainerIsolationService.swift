@@ -440,6 +440,11 @@ struct ContainerRunnerConfiguration {
     /// Default container image: GitHub's official runner image, which ships the
     /// Actions runner in /home/runner. (`ghcr.io/actions/runner` doesn't exist.)
     static let defaultRunnerImage = "ghcr.io/actions/actions-runner:latest"
+
+    /// CPUs and memory for `runner`'s VM: its own, else 2 CPUs and 4 GiB.
+    static func resources(for runner: Runner) -> (cpuCount: Int, memoryInBytes: UInt64) {
+        (runner.effectiveContainerCPUs, .mib(runner.effectiveContainerMemoryMB))
+    }
 }
 
 // MARK: - Helper Extensions

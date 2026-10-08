@@ -17,6 +17,9 @@ import Yams
 ///   - name: org-builder
 ///     org: omniaura
 ///     isolation: container
+///     engine: docker      # apple (default) | docker
+///     cpus: 4             # default 2
+///     memory: 8g          # 8g, 8192m, or MB; default 4g
 ///     enable-gui: false
 ///     open-files: 65536
 ///     quiet-hours: never
@@ -50,13 +53,43 @@ struct DeclarativeConfig: Codable, Equatable {
         var openFiles: Int?
         var quietHours: QuietHoursSpec?
         var image: String?
+        var engine: String?
+        var cpus: Int?
+        var memory: MemorySpec?
         var count: Int?
 
         enum CodingKeys: String, CodingKey {
-            case name, repo, org, labels, isolation, image, count
+            case name, repo, org, labels, isolation, image, engine, cpus, memory, count
             case enableGUI = "enable-gui"
             case openFiles = "open-files"
             case quietHours = "quiet-hours"
+        }
+    }
+
+    /// A container's memory: megabytes (`8192`) or a size (`8g`, `8192m`).
+    struct MemorySpec: Codable, Equatable {
+        var text: String
+
+        init(_ text: String) {
+            self.text = text
+        }
+
+        init(megabytes: Int) {
+            text = ResourceLimits.containerMemoryText(megabytes: megabytes)
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let megabytes = try? container.decode(Int.self) {
+                text = String(megabytes)
+            } else {
+                text = try container.decode(String.self)
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(text)
         }
     }
 
@@ -155,7 +188,7 @@ struct DeclarativeConfig: Codable, Equatable {
         for (index, runner) in ((root["runners"] as? [Any]) ?? []).enumerated() {
             guard let runner = runner as? [String: Any] else { continue }
             let name = (runner["name"] as? String).map { " '\($0)'" } ?? " #\(index + 1)"
-            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "count"], context: " in runner\(name)")
+            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "engine", "cpus", "memory", "count"], context: " in runner\(name)")
         }
     }
 
@@ -180,8 +213,12 @@ struct DeclarativeConfig: Codable, Equatable {
     // MARK: - Resolution
 
     /// Runner specs expanded (`count`) and validated. `globalIsolation` is the
-    /// global mode that will apply (for runners that don't set `isolation`).
-    func desiredRunners(globalIsolation: IsolationMode = IsolationMode.none) throws -> [DesiredRunner] {
+    /// global mode that will apply (for runners that don't set `isolation`);
+    /// `hostCores` bounds `cpus`.
+    func desiredRunners(
+        globalIsolation: IsolationMode = IsolationMode.none,
+        hostCores: Int = ProcessInfo.processInfo.processorCount
+    ) throws -> [DesiredRunner] {
         var result: [DesiredRunner] = []
         for spec in runners {
             let name = spec.name.trimmingCharacters(in: .whitespaces)
@@ -210,8 +247,14 @@ struct DeclarativeConfig: Codable, Equatable {
             }
             let isolation = try Self.isolation(spec.isolation, context: name)
             let effectiveIsolation = isolation ?? globalIsolation
-            if spec.image != nil && effectiveIsolation != .container {
-                throw DeclarativeConfigError.invalid("\(name): image requires container isolation")
+            let engine = try Self.engine(spec.engine, context: name)
+            let memoryMB = try spec.memory.map { try Self.memoryMB($0.text, context: name) }
+            let containerKeys = [("image", spec.image != nil), ("engine", engine != nil), ("cpus", spec.cpus != nil), ("memory", memoryMB != nil)]
+            if effectiveIsolation != .container, let key = containerKeys.first(where: { $0.1 })?.0 {
+                throw DeclarativeConfigError.invalid("\(name): \(key) requires container isolation")
+            }
+            if let cpus = spec.cpus, let problem = ResourceLimits.containerCPUsProblem(cpus, hostCores: hostCores) {
+                throw DeclarativeConfigError.invalid("\(name): cpus \(problem)")
             }
             if let openFiles = spec.openFiles, openFiles < 1 {
                 throw DeclarativeConfigError.invalid("\(name): open-files must be positive")
@@ -225,7 +268,10 @@ struct DeclarativeConfig: Codable, Equatable {
                 enableGUI: spec.enableGUI ?? false,
                 openFileLimit: spec.openFiles,
                 quietHours: try spec.quietHours?.resolved(),
-                containerImage: spec.image
+                containerImage: spec.image,
+                containerEngine: engine,
+                containerCPUs: spec.cpus,
+                containerMemoryMB: memoryMB
             )
             if count == 1 {
                 result.append(desired)
@@ -264,6 +310,26 @@ struct DeclarativeConfig: Codable, Equatable {
         case .dedicatedUser?: return "user"
         case .container?: return "container"
         }
+    }
+
+    /// nil = Apple's engine.
+    static func engine(_ text: String?, context: String) throws -> ContainerEngine? {
+        guard let text else { return nil }
+        guard let engine = ContainerEngine(rawValue: text.lowercased()) else {
+            throw DeclarativeConfigError.invalid("\(context): engine '\(text)' must be apple or docker")
+        }
+        return engine
+    }
+
+    /// Megabytes in a `memory` value, which must be at least 1g.
+    static func memoryMB(_ text: String, context: String) throws -> Int {
+        guard let megabytes = ResourceLimits.containerMemoryMB(from: text) else {
+            throw DeclarativeConfigError.invalid("\(context): memory '\(text)' must be a size like 8g, 8192m, or 8192 (MB)")
+        }
+        if let problem = ResourceLimits.containerMemoryProblem(megabytes) {
+            throw DeclarativeConfigError.invalid("\(context): memory \(problem)")
+        }
+        return megabytes
     }
 
     /// Settings with the file's overrides applied.
@@ -315,6 +381,9 @@ struct DeclarativeConfig: Codable, Equatable {
                     openFiles: runner.openFileLimit,
                     quietHours: runner.quietHours.map(QuietHoursSpec.init),
                     image: runner.containerImage,
+                    engine: runner.effectiveContainerEngine == .apple ? nil : runner.effectiveContainerEngine.rawValue,
+                    cpus: runner.containerCPUs,
+                    memory: runner.containerMemoryMB.map { MemorySpec(megabytes: $0) },
                     count: nil
                 )
             }
@@ -353,6 +422,9 @@ struct DesiredRunner: Equatable {
     var openFileLimit: Int?
     var quietHours: QuietHours?
     var containerImage: String? = nil
+    var containerEngine: ContainerEngine? = nil
+    var containerCPUs: Int? = nil
+    var containerMemoryMB: Int? = nil
 }
 
 /// What `mac-runner apply` will do.
@@ -440,6 +512,25 @@ enum ConfigPlanner {
                 updates.append("image \(have.containerImage ?? "default") → \(want.containerImage ?? "default")")
                 restart = true
             }
+            // nil and Apple's are the same engine.
+            let haveEngine = have.effectiveContainerEngine, wantEngine = want.containerEngine ?? .apple
+            if haveEngine != wantEngine {
+                updates.append("engine \(haveEngine.rawValue) → \(wantEngine.rawValue)")
+                restart = true
+            }
+            // Pinning a value to the default restarts nothing.
+            if have.containerCPUs != want.containerCPUs {
+                updates.append("cpus \(have.containerCPUs.map(String.init) ?? "default") → \(want.containerCPUs.map(String.init) ?? "default")")
+                if have.effectiveContainerCPUs != want.containerCPUs ?? ResourceLimits.defaultContainerCPUs {
+                    restart = true
+                }
+            }
+            if have.containerMemoryMB != want.containerMemoryMB {
+                updates.append("memory \(describeMemory(have.containerMemoryMB)) → \(describeMemory(want.containerMemoryMB))")
+                if have.effectiveContainerMemoryMB != want.containerMemoryMB ?? ResourceLimits.defaultContainerMemoryMB {
+                    restart = true
+                }
+            }
             if have.openFileLimit != want.openFileLimit {
                 updates.append("open-files \(have.openFileLimit.map(String.init) ?? "default") → \(want.openFileLimit.map(String.init) ?? "default")")
                 restart = true
@@ -464,6 +555,10 @@ enum ConfigPlanner {
     static func describe(_ quietHours: QuietHours?) -> String {
         guard let quietHours else { return "global" }
         return quietHours.enabled ? quietHours.displayRange : "never"
+    }
+
+    static func describeMemory(_ megabytes: Int?) -> String {
+        megabytes.map { ResourceLimits.containerMemoryText(megabytes: $0) } ?? "default"
     }
 
     static func describeSettingChanges(from old: AppSettings, to new: AppSettings) -> [String] {

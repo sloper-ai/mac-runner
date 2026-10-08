@@ -20,7 +20,8 @@ Simple Mac menu bar app and CLI for managing GitHub Actions self-hosted runners.
 - 📜 **Log viewer**: live-tail, filter, and export runner output and diagnostics (`mac-runner logs <name> --follow`), with log rotation
 - 🪟 **Dashboard window**: every runner's status, current job, recent jobs, resources, and logs in one window
 - 🔔 **Job notifications**: native notifications when jobs start and finish (caught from each runner's own log, so even jobs of a few seconds show up), and an animated menu bar icon while any runner is executing
-- 📦 **Custom container images**: run Linux runners on your own OCI images (linux/arm64 with `bash`; see [Container Isolation](#3-container-isolation-macos-26-apple-silicon) for requirements), each with its own virtual display when GUI access is on
+- 📦 **Custom container images**: run Linux runners on your own OCI images (linux/arm64 with `bash`; see [Container Isolation](#3-container-isolation-linux-runners) for requirements), each with its own virtual display when GUI access is on
+- 🐳 **Docker engine**: run Linux container runners in Docker (Docker Desktop, OrbStack, Colima) instead of Apple's Containerization, with local images and the work directory in a Docker volume; set each container's CPUs and memory on either engine
 - 🗂️ **Declarative config**: describe runners in `.mac-runner.yml` and `mac-runner apply` them (`mac-runner export` to start)
 
 ## Why?
@@ -47,9 +48,9 @@ Download the latest DMG from [Releases](https://github.com/omniaura/mac-runner/r
 
 ### Prerequisites
 
-- macOS 13+ (macOS 15+ for user isolation, macOS 26+ for container isolation)
+- macOS 13+ (macOS 15+ for user isolation, macOS 26+ for container isolation with Apple's engine)
 - [`gh` CLI](https://cli.github.com/) installed and authenticated (`gh auth login`)
-- Apple Silicon Mac (for container isolation)
+- Apple Silicon Mac (for container isolation with Apple's engine), or Docker (for its [Docker engine](#docker-engine))
 
 ## Quick Start
 
@@ -176,6 +177,10 @@ runners:
   - name: linux-builder
     org: omniaura
     isolation: container           # none | user | container | global (default: global)
+    engine: docker                 # container isolation: apple | docker (default: apple)
+    image: my-ci-image:latest      # container isolation (default: ghcr.io/actions/actions-runner:latest)
+    cpus: 4                        # container isolation (default: 2)
+    memory: 8g                     # container isolation: 8g, 8192m, or MB (default: 4g)
     enable-gui: false              # default: false (headless)
     open-files: 65536              # default: the global limit
     quiet-hours: never             # never | { start, end } (default: global schedule)
@@ -187,9 +192,11 @@ Runners are matched by name. What happens to an existing runner depends on what 
 |---|---|
 | New name | Registers and starts the runner |
 | `repo`/`org`, `labels`, or `isolation` | Unregisters and registers the runner again |
-| `enable-gui` or `open-files` | Updates it, restarting it if it's running |
+| `enable-gui`, `open-files`, `image`, `engine`, `cpus`, or `memory` | Updates it, restarting it if it's running |
 | `quiet-hours` | Updates it in place |
 | Name no longer in the file | Unregisters it and deletes its workspace (unless `--no-prune`) |
+
+A restart never interrupts a job: the change applies when the runner next starts. An `engine` change is the exception, since a runner must stop on the engine it started on: while a job runs it's left for later, so run `apply` again once the runner is idle.
 
 ## CI/CD: Self-Hosted Runner with Automatic Cloud Fallback
 
@@ -271,10 +278,10 @@ Mac Runner supports three isolation modes to protect your development environmen
   Settings → Isolation Mode → Dedicated User
   ```
 
-### 3. Container Isolation (macOS 26+, Apple Silicon)
-- Runs each runner as a **Linux** (arm64) runner inside its own lightweight VM, using Apple's [Containerization framework](https://github.com/apple/containerization)
+### 3. Container Isolation (Linux runners)
+- Runs each runner as a **Linux** (arm64) runner inside its own lightweight VM, using Apple's [Containerization framework](https://github.com/apple/containerization), or in a Docker container with the [Docker engine](#docker-engine)
 - Best for Linux-based workflows and cross-platform testing
-- **Requirements:** macOS 26+, Apple Silicon, and a Linux kernel (see below)
+- **Requirements:** macOS 26+, Apple Silicon, and a Linux kernel (see below) for Apple's engine; a running Docker for the Docker engine
 - **How to enable:**
   ```bash
   # CLI (default image: GitHub's ghcr.io/actions/actions-runner:latest)
@@ -283,8 +290,11 @@ Mac Runner supports three isolation modes to protect your development environmen
   # With your own image
   mac-runner add owner/repo --isolation container --image ghcr.io/myorg/ci-image:latest
 
+  # In Docker, with more CPUs and memory
+  mac-runner add owner/repo --isolation container --engine docker --cpus 4 --memory 8g
+
   # GUI
-  Add Runner → Isolation Mode → Container (optionally set Container Image)
+  Add Runner → Isolation Mode → Container (optionally pick the Engine and set Container Image)
   ```
 
 **Kernel.** Mac Runner looks for a Linux kernel at `MacRunner.app/Contents/Resources/vmlinux` or `~/Library/Application Support/MacRunner/vmlinux`. The [Kata Containers](https://github.com/kata-containers/kata-containers/releases) kernel works:
@@ -302,9 +312,28 @@ cp -L opt/kata/share/kata-containers/vmlinux.container ~/Library/Application\ Su
 
 **Tools.** When a container runner is created, Mac Runner picks the tools its jobs are likely to need: the GitHub CLI, toolchains detected from the repository (Node, Python, Go, Ruby, Rust), and any **Extra CI Tools** from Settings (installed as apt packages). They're installed with `apt-get` each time the runner's container starts, never per job.
 
-**Lifetime.** A container runner's VM lives inside the process that started it. Start container runners from the menu bar app to keep them running in the background. `mac-runner add`/`start` for a container runner stays in the foreground and streams its output until you press Ctrl-C.
+**CPUs and memory.** Each container gets 2 CPUs and 4 GB unless its runner sets its own: `--cpus 4 --memory 8g` on `mac-runner add` (memory as `8g`, `8192m`, or a number of MB), or `cpus` and `memory` in a [config file](#declarative-configuration). CPUs can't exceed the Mac's cores, and memory must be at least `1g`. `mac-runner list` and `status` show them when they aren't the defaults.
+
+**Lifetime.** With Apple's engine, a container runner's VM lives inside the process that started it. Start container runners from the menu bar app to keep them running in the background. `mac-runner add`/`start` for a container runner stays in the foreground and streams its output until you press Ctrl-C. (Docker runners run in the background on their own; see below.)
 
 Container runners register with the name and labels you give them (default labels: `linux, mac-runner`). Their `runner.log` and `_diag` logs sit in the runner's directory like other modes (`mac-runner logs <name>`).
+
+#### Docker engine
+
+Container runners can run in Docker instead of Apple's Containerization, with Docker Desktop, OrbStack, Colima, or anything else that gives you a working `docker` CLI. Use it on Macs without macOS 26, to run images you've built locally, or when jobs need a real Linux filesystem for their work directory: Apple's engine shares `_work` from the Mac over virtio-fs, which refuses some files Linux tools create (GNU tar's mode-0 placeholder files, for one, so `actions/setup-node` can't extract Node there).
+
+```bash
+mac-runner add owner/repo --isolation container --engine docker
+mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest
+```
+
+In a config file, set `engine: docker` on the runner (`apple` is the default). In the GUI: Add Runner → Isolation Mode → Container → Engine: Docker.
+
+- **Images** come from Docker: an image you've built (`docker build -t my-ci-image .`) works without a registry, and others are pulled the first time a runner uses them. The image requirements above apply. If the image's user isn't root, it needs passwordless `sudo` (as GitHub's runner image has) to take over the work volume, which Docker creates owned by root.
+- **Work directory.** `_work` is the Docker volume `mac-runner-<runner id>-work` (shown in the dashboard), so checkouts and the tool cache survive restarts. It's deleted with the runner by `mac-runner remove` and `mac-runner uninstall`; `mac-runner cleanup` leaves it alone (to empty it, stop the runner and `docker volume rm` it). `runner.log` and `_diag` stay in the runner's directory on the Mac, which Docker must be able to mount writable (Docker Desktop and OrbStack can by default).
+- **Lifetime.** A Docker runner is an ordinary background process, like a runner without isolation: `docker-run.sh` in its directory runs `docker run` in the foreground. It keeps running after `mac-runner add`/`start` returns and when the menu bar app quits. Stopping it stops and removes its container.
+- **Docker must be running** when the runner starts. At login, Mac Runner gives Docker up to two minutes to start before restarting Docker runners.
+- **CPUs and memory** are `docker run --cpus` and `--memory` limits, so Docker needs at least that many CPUs itself (Docker Desktop → Settings → Resources). A runner that asks for more than Docker has doesn't start; one on the defaults gets at most what Docker has.
 
 ### Per-Runner Isolation Override
 
@@ -324,7 +353,7 @@ mac-runner add owner/trusted-project --isolation none
 In the GUI, each runner displays its isolation mode with an icon:
 - 🔓 No isolation
 - 👤 User isolation
-- 📦 Container isolation
+- 📦 Container isolation ("Container (Docker)" on the Docker engine)
 
 ## GUI Access
 
