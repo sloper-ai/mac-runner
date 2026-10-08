@@ -21,25 +21,29 @@
       }
     ],
     [
-      "@semantic-release/github",
+      "@semantic-release/exec",
       {
-        "assets": [
-          {
-            "path": "build/*.zip",
-            "label": "MacRunner ZIP (${nextRelease.version})"
-          },
-          {
-            "path": "build/*.dmg",
-            "label": "MacRunner DMG (${nextRelease.version})"
-          }
-        ]
+        "prepareCmd": "./scripts/build-release.sh ${nextRelease.version}"
       }
     ],
     [
       "@semantic-release/git",
       {
         "assets": ["CHANGELOG.md", "Casks/mac-runner.rb"],
-        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+        "message": "chore(release): ${nextRelease.version} [skip ci]"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "assets": [
+          {
+            "path": "build/MacRunner-*.zip",
+            "label": "MacRunner ${nextRelease.version} (universal, zip)"
+          }
+        ],
+        "successCommentCondition": false,
+        "failCommentCondition": false
       }
     ]
   ]

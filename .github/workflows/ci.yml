@@ -1,5 +1,7 @@
 name: CI
 
+# The organization allows only GitHub-owned actions, pinned to a full commit SHA.
+
 on:
   pull_request:
     branches: [main]
@@ -8,18 +10,25 @@ concurrency:
   group: ci-${{ github.head_ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     name: Build & Test
-    runs-on: macos-latest
+    # Same image as the release; its default Xcode (26.x) has the Swift 6 toolchain
+    # and macOS 26 SDK that Apple's Containerization package needs.
+    runs-on: macos-26
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          xcode-version: latest-stable
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
 
       - name: Reset SwiftPM state
         run: |
