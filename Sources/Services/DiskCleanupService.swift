@@ -40,6 +40,8 @@ struct DiskCleanupService {
             }
 
             let isolation = runner.effectiveIsolationMode(global: globalIsolationMode)
+            // Container runners are left alone. (On Docker, _work is a volume,
+            // not part of the runner's directory; it's removed with the runner.)
             guard isolation != .container,
                   let runnerDirectory = try? RunnerDirectory.path(for: runner.id, isolation: isolation) else {
                 continue

@@ -17,6 +17,13 @@ import Yams
 ///   - name: org-builder
 ///     org: omniaura
 ///     isolation: container
+///     engine: docker      # apple (default) | docker
+///     cpus: 4             # default 2
+///     memory: 8g          # 8g, 8192m, or MB; default 4g
+///     jit: true           # a single-use registration and fresh workspace per job
+///     tools: []           # install nothing at start (default: detected tools)
+///     cache: [/home/runner/.cargo/registry]   # Docker volumes kept across jobs
+///     docker: true        # Docker for jobs (Docker-in-Docker), Docker engine only
 ///     enable-gui: false
 ///     open-files: 65536
 ///     quiet-hours: never
@@ -50,13 +57,47 @@ struct DeclarativeConfig: Codable, Equatable {
         var openFiles: Int?
         var quietHours: QuietHoursSpec?
         var image: String?
+        var engine: String?
+        var cpus: Int?
+        var memory: MemorySpec?
         var count: Int?
+        var jit: Bool?
+        var tools: [String]?
+        var cache: [String]?
+        var docker: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case name, repo, org, labels, isolation, image, count
+            case name, repo, org, labels, isolation, image, engine, cpus, memory, count, jit, tools, cache, docker
             case enableGUI = "enable-gui"
             case openFiles = "open-files"
             case quietHours = "quiet-hours"
+        }
+    }
+
+    /// A container's memory: megabytes (`8192`) or a size (`8g`, `8192m`).
+    struct MemorySpec: Codable, Equatable {
+        var text: String
+
+        init(_ text: String) {
+            self.text = text
+        }
+
+        init(megabytes: Int) {
+            text = ResourceLimits.containerMemoryText(megabytes: megabytes)
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let megabytes = try? container.decode(Int.self) {
+                text = String(megabytes)
+            } else {
+                text = try container.decode(String.self)
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(text)
         }
     }
 
@@ -155,7 +196,7 @@ struct DeclarativeConfig: Codable, Equatable {
         for (index, runner) in ((root["runners"] as? [Any]) ?? []).enumerated() {
             guard let runner = runner as? [String: Any] else { continue }
             let name = (runner["name"] as? String).map { " '\($0)'" } ?? " #\(index + 1)"
-            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "count"], context: " in runner\(name)")
+            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "engine", "cpus", "memory", "count", "jit", "tools", "cache", "docker"], context: " in runner\(name)")
         }
     }
 
@@ -180,8 +221,12 @@ struct DeclarativeConfig: Codable, Equatable {
     // MARK: - Resolution
 
     /// Runner specs expanded (`count`) and validated. `globalIsolation` is the
-    /// global mode that will apply (for runners that don't set `isolation`).
-    func desiredRunners(globalIsolation: IsolationMode = IsolationMode.none) throws -> [DesiredRunner] {
+    /// global mode that will apply (for runners that don't set `isolation`);
+    /// `hostCores` bounds `cpus`.
+    func desiredRunners(
+        globalIsolation: IsolationMode = IsolationMode.none,
+        hostCores: Int = ProcessInfo.processInfo.processorCount
+    ) throws -> [DesiredRunner] {
         var result: [DesiredRunner] = []
         for spec in runners {
             let name = spec.name.trimmingCharacters(in: .whitespaces)
@@ -210,8 +255,34 @@ struct DeclarativeConfig: Codable, Equatable {
             }
             let isolation = try Self.isolation(spec.isolation, context: name)
             let effectiveIsolation = isolation ?? globalIsolation
-            if spec.image != nil && effectiveIsolation != .container {
-                throw DeclarativeConfigError.invalid("\(name): image requires container isolation")
+            let engine = try Self.engine(spec.engine, context: name)
+            let memoryMB = try spec.memory.map { try Self.memoryMB($0.text, context: name) }
+            let containerKeys = [
+                ("image", spec.image != nil), ("engine", engine != nil), ("cpus", spec.cpus != nil), ("memory", memoryMB != nil),
+                ("tools", spec.tools != nil), ("cache", spec.cache != nil), ("docker", spec.docker == true),
+            ]
+            if effectiveIsolation != .container, let key = containerKeys.first(where: { $0.1 })?.0 {
+                throw DeclarativeConfigError.invalid("\(name): \(key) requires container isolation")
+            }
+            let tools = try spec.tools.map { try Self.tools($0, context: name) }
+            let cachePaths = try spec.cache.map { paths -> [String] in
+                guard engine == .docker else {
+                    throw DeclarativeConfigError.invalid("\(name): cache requires the Docker engine (engine: docker)")
+                }
+                switch DockerRunnerEngine.cachePaths(paths) {
+                case .success(let normalized): return normalized
+                case .failure(let error): throw DeclarativeConfigError.invalid("\(name): \(error.text)")
+                }
+            }
+            if spec.docker == true && engine != .docker {
+                throw DeclarativeConfigError.invalid("\(name): docker requires the Docker engine (engine: docker)")
+            }
+            let labels = spec.labels ?? Runner.defaultLabels(for: effectiveIsolation)
+            if spec.jit == true && labels.isEmpty {
+                throw DeclarativeConfigError.invalid("\(name): a jit runner needs at least one label (GitHub gives it only those)")
+            }
+            if let cpus = spec.cpus, let problem = ResourceLimits.containerCPUsProblem(cpus, hostCores: hostCores) {
+                throw DeclarativeConfigError.invalid("\(name): cpus \(problem)")
             }
             if let openFiles = spec.openFiles, openFiles < 1 {
                 throw DeclarativeConfigError.invalid("\(name): open-files must be positive")
@@ -220,12 +291,19 @@ struct DeclarativeConfig: Codable, Equatable {
             let desired = DesiredRunner(
                 name: name,
                 target: target,
-                labels: spec.labels ?? Runner.defaultLabels(for: effectiveIsolation),
+                labels: labels,
                 isolation: isolation,
                 enableGUI: spec.enableGUI ?? false,
                 openFileLimit: spec.openFiles,
                 quietHours: try spec.quietHours?.resolved(),
-                containerImage: spec.image
+                containerImage: spec.image,
+                containerEngine: engine,
+                containerCPUs: spec.cpus,
+                containerMemoryMB: memoryMB,
+                jit: spec.jit ?? false,
+                containerToolsOverride: tools,
+                containerCachePaths: cachePaths.flatMap { $0.isEmpty ? nil : $0 },
+                dockerInDocker: spec.docker ?? false
             )
             if count == 1 {
                 result.append(desired)
@@ -264,6 +342,42 @@ struct DeclarativeConfig: Codable, Equatable {
         case .dedicatedUser?: return "user"
         case .container?: return "container"
         }
+    }
+
+    /// nil = Apple's engine.
+    static func engine(_ text: String?, context: String) throws -> ContainerEngine? {
+        guard let text else { return nil }
+        guard let engine = ContainerEngine(rawValue: text.lowercased()) else {
+            throw DeclarativeConfigError.invalid("\(context): engine '\(text)' must be apple or docker")
+        }
+        return engine
+    }
+
+    /// A `tools` list: tool names as Mac Runner plans them (gh, node, python,
+    /// go, ruby, rust) or apt packages. [] means install nothing.
+    static func tools(_ names: [String], context: String) throws -> [String] {
+        var tools: [String] = []
+        for name in names {
+            let tool = name.trimmingCharacters(in: .whitespaces).lowercased()
+            guard tool.range(of: #"^[a-z0-9][a-z0-9@+._-]*$"#, options: .regularExpression) != nil else {
+                throw DeclarativeConfigError.invalid("\(context): tool '\(name)' must be a tool or apt package name")
+            }
+            if !tools.contains(tool) {
+                tools.append(tool)
+            }
+        }
+        return tools
+    }
+
+    /// Megabytes in a `memory` value, which must be at least 1g.
+    static func memoryMB(_ text: String, context: String) throws -> Int {
+        guard let megabytes = ResourceLimits.containerMemoryMB(from: text) else {
+            throw DeclarativeConfigError.invalid("\(context): memory '\(text)' must be a size like 8g, 8192m, or 8192 (MB)")
+        }
+        if let problem = ResourceLimits.containerMemoryProblem(megabytes) {
+            throw DeclarativeConfigError.invalid("\(context): memory \(problem)")
+        }
+        return megabytes
     }
 
     /// Settings with the file's overrides applied.
@@ -315,7 +429,14 @@ struct DeclarativeConfig: Codable, Equatable {
                     openFiles: runner.openFileLimit,
                     quietHours: runner.quietHours.map(QuietHoursSpec.init),
                     image: runner.containerImage,
-                    count: nil
+                    engine: runner.effectiveContainerEngine == .apple ? nil : runner.effectiveContainerEngine.rawValue,
+                    cpus: runner.containerCPUs,
+                    memory: runner.containerMemoryMB.map { MemorySpec(megabytes: $0) },
+                    count: nil,
+                    jit: runner.isJIT ? true : nil,
+                    tools: runner.containerToolsOverride,
+                    cache: runner.containerCachePaths.flatMap { $0.isEmpty ? nil : $0 },
+                    docker: runner.dockerInDocker == true ? true : nil
                 )
             }
         )
@@ -353,6 +474,17 @@ struct DesiredRunner: Equatable {
     var openFileLimit: Int?
     var quietHours: QuietHours?
     var containerImage: String? = nil
+    var containerEngine: ContainerEngine? = nil
+    var containerCPUs: Int? = nil
+    var containerMemoryMB: Int? = nil
+    /// Single-use (JIT) registrations.
+    var jit: Bool = false
+    /// Tools to install at each container start instead of the detected ones; [] = none.
+    var containerToolsOverride: [String]? = nil
+    /// Docker engine: container paths kept in cache volumes.
+    var containerCachePaths: [String]? = nil
+    /// Docker engine: Docker for jobs (Docker-in-Docker).
+    var dockerInDocker: Bool = false
 }
 
 /// What `mac-runner apply` will do.
@@ -440,8 +572,43 @@ enum ConfigPlanner {
                 updates.append("image \(have.containerImage ?? "default") → \(want.containerImage ?? "default")")
                 restart = true
             }
+            // nil and Apple's are the same engine.
+            let haveEngine = have.effectiveContainerEngine, wantEngine = want.containerEngine ?? .apple
+            if haveEngine != wantEngine {
+                updates.append("engine \(haveEngine.rawValue) → \(wantEngine.rawValue)")
+                restart = true
+            }
+            // Pinning a value to the default restarts nothing.
+            if have.containerCPUs != want.containerCPUs {
+                updates.append("cpus \(have.containerCPUs.map(String.init) ?? "default") → \(want.containerCPUs.map(String.init) ?? "default")")
+                if have.effectiveContainerCPUs != want.containerCPUs ?? ResourceLimits.defaultContainerCPUs {
+                    restart = true
+                }
+            }
+            if have.containerMemoryMB != want.containerMemoryMB {
+                updates.append("memory \(describeMemory(have.containerMemoryMB)) → \(describeMemory(want.containerMemoryMB))")
+                if have.effectiveContainerMemoryMB != want.containerMemoryMB ?? ResourceLimits.defaultContainerMemoryMB {
+                    restart = true
+                }
+            }
             if have.openFileLimit != want.openFileLimit {
                 updates.append("open-files \(have.openFileLimit.map(String.init) ?? "default") → \(want.openFileLimit.map(String.init) ?? "default")")
+                restart = true
+            }
+            if have.isJIT != want.jit {
+                updates.append(want.jit ? "jit on" : "jit off")
+                restart = true
+            }
+            if have.containerToolsOverride != want.containerToolsOverride {
+                updates.append("tools \(describeTools(have.containerToolsOverride)) → \(describeTools(want.containerToolsOverride))")
+                restart = true
+            }
+            if (have.containerCachePaths ?? []) != (want.containerCachePaths ?? []) {
+                updates.append("cache \(describeCache(have.containerCachePaths)) → \(describeCache(want.containerCachePaths))")
+                restart = true
+            }
+            if (have.dockerInDocker == true) != want.dockerInDocker {
+                updates.append(want.dockerInDocker ? "docker on" : "docker off")
                 restart = true
             }
             if !QuietHours.equivalent(have.quietHours, want.quietHours) {
@@ -464,6 +631,20 @@ enum ConfigPlanner {
     static func describe(_ quietHours: QuietHours?) -> String {
         guard let quietHours else { return "global" }
         return quietHours.enabled ? quietHours.displayRange : "never"
+    }
+
+    static func describeMemory(_ megabytes: Int?) -> String {
+        megabytes.map { ResourceLimits.containerMemoryText(megabytes: $0) } ?? "default"
+    }
+
+    static func describeTools(_ tools: [String]?) -> String {
+        guard let tools else { return "detected" }
+        return tools.isEmpty ? "none" : "[\(tools.joined(separator: ", "))]"
+    }
+
+    static func describeCache(_ paths: [String]?) -> String {
+        let paths = paths ?? []
+        return paths.isEmpty ? "none" : "[\(paths.joined(separator: ", "))]"
     }
 
     static func describeSettingChanges(from old: AppSettings, to new: AppSettings) -> [String] {

@@ -17,6 +17,12 @@ class ProcessManager {
     ///   - isolation: Isolation mode to use
     ///   - enableGUI: Whether to enable GUI access (default: false, headless)
     ///   - openFileLimit: Maximum open file limit to apply before launch
+    ///   - extraEnvironment: Variables added to the process's environment for
+    ///     `.none` and `.container` (e.g. a Docker runner's registration token).
+    ///     They're only ever passed to the process, never written to disk.
+    ///   - jitConfig: A JIT runner's config, for `.none` and `.dedicatedUser`:
+    ///     the launch resets the workspace and hands it to run.sh in
+    ///     `ACTIONS_RUNNER_INPUT_JITCONFIG` (never in argv; see `JITRunner`).
     /// - Returns: The launched Process object
     /// - Throws: Error if process launch or PID write fails
     func startProcess(
@@ -26,12 +32,15 @@ class ProcessManager {
         logFile: String,
         isolation: IsolationMode,
         enableGUI: Bool = false,
-        openFileLimit: Int
+        openFileLimit: Int,
+        extraEnvironment: [String: String] = [:],
+        jitConfig: String? = nil
     ) throws -> Process {
         let process: Process
 
         switch isolation {
         case .none, .container:
+            let command = try Self.launchCommand(executable: executable, runnerDirectory: workingDirectory, jit: jitConfig != nil)
             // Append to the existing log (earlier runs and Mac Runner's own
             // events stay visible), rotating it first if it has grown too big.
             RunnerLogs.rotateIfNeeded(logFile)
@@ -43,15 +52,20 @@ class ProcessManager {
             // Launch process via bash to set resource limits
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-            let escapedExec = executable.replacingOccurrences(of: "'", with: "'\\''")
-            proc.arguments = ["-c", ResourceLimits.shellCommand("exec '\(escapedExec)'", openFileLimit: openFileLimit)]
+            proc.arguments = ["-c", ResourceLimits.shellCommand(command, openFileLimit: openFileLimit)]
             proc.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
             proc.standardOutput = logHandle
             proc.standardError = logHandle
 
             let env = RunnerEnvironment.environment(enableGUI: enableGUI)
+            // The snapshot records PATH only, and from before the extra variables.
             try RunnerEnvironment.writePathSnapshot(in: workingDirectory, environment: env)
-            proc.environment = env
+            var extra = extraEnvironment
+            if let jitConfig {
+                // Without sudo, the environment reaches run.sh as it is.
+                extra[JITRunner.configVariable] = jitConfig
+            }
+            proc.environment = env.merging(extra) { _, extra in extra }
 
             do {
                 try proc.run()
@@ -91,7 +105,15 @@ class ProcessManager {
 
             // Launch process as dedicated user with logging enabled
             let proc: Process
+            var jitConfigFile: String?
             do {
+                if let jitConfig {
+                    // sudo resets the environment: the config waits in a file
+                    // only the service user can read, until the launch takes it.
+                    jitConfigFile = try JITRunner.writeConfigFile(
+                        jitConfig, runnerDirectory: workingDirectory, serviceUser: username
+                    )
+                }
                 proc = try isolationService.launchAsUser(
                     username: username,
                     executable: executable,
@@ -99,11 +121,15 @@ class ProcessManager {
                     standardOutput: logHandle,
                     standardError: logHandle,
                     enableGUI: enableGUI,
-                    openFileLimit: openFileLimit
+                    openFileLimit: openFileLimit,
+                    jitConfigFile: jitConfigFile
                 )
                 process = proc
             } catch {
                 try? logHandle.close()
+                if jitConfigFile != nil {
+                    JITRunner.removeCredentials(runnerDirectory: workingDirectory, serviceUser: username)
+                }
                 throw error
             }
         }
@@ -113,6 +139,15 @@ class ProcessManager {
         try pidManager.writePID(pid, for: id)
 
         return process
+    }
+
+    /// The `.none` and `.container` launch: exec the executable. A JIT runner's
+    /// workspace is reset first (`JITRunner.launchPrelude`).
+    static func launchCommand(executable: String, runnerDirectory: String, jit: Bool) throws -> String {
+        let run = "exec '\(executable.replacingOccurrences(of: "'", with: "'\\''"))'"
+        guard jit else { return run }
+        try JITRunner.requireRunnerDirectory(runnerDirectory)
+        return JITRunner.launchPrelude(runnerDirectory: runnerDirectory, configFile: nil) + " && " + run
     }
 
     /// Shell command (run as the service user) that creates the runner log,

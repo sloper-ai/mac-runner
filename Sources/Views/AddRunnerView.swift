@@ -11,8 +11,10 @@ struct AddRunnerView: View {
     @State private var labelsText = "macos, mac-runner"
     @State private var selectedIsolation: IsolationSelection = .global
     @State private var enableGUI = false
+    @State private var jit = false
     @State private var openFileLimitText = ""
     @State private var containerImage = ""
+    @State private var containerEngine: ContainerEngine = .apple
     @State private var repoSections: [(header: String, repos: [String])] = []
     @State private var orgs: [String] = []
     @State private var repoSearchText = ""
@@ -28,7 +30,7 @@ struct AddRunnerView: View {
         case global = "Global (from settings)"
         case none = "None (no isolation)"
         case user = "User (dedicated user)"
-        case container = "Container (macOS 26+)"
+        case container = "Container (Linux)"
 
         var id: String { rawValue }
 
@@ -180,13 +182,22 @@ struct AddRunnerView: View {
                             }
                         }
 
-                        // Warning for container isolation
+                        // Engine, its requirements, and the image for container isolation
                         if selectedIsolation == .container {
+                            Picker("Engine", selection: $containerEngine) {
+                                Text("Apple").tag(ContainerEngine.apple)
+                                Text("Docker").tag(ContainerEngine.docker)
+                            }
+                            .pickerStyle(.segmented)
+                            .help("What runs the runner's Linux container: Apple's Containerization, or Docker")
+
                             HStack(spacing: 6) {
                                 Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundColor(.orange)
                                     .font(.caption)
-                                Text("Requires macOS 26.0+ on Apple Silicon")
+                                Text(containerEngine == .docker
+                                    ? "Requires Docker (Docker Desktop, OrbStack, or Colima) to be running"
+                                    : "Requires macOS 26.0+ on Apple Silicon")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -194,7 +205,9 @@ struct AddRunnerView: View {
                             TextField(ContainerRunnerConfiguration.defaultRunnerImage, text: $containerImage)
                                 .textFieldStyle(.roundedBorder)
                                 .help("OCI image the runner's Linux container uses")
-                            Text("Container image. Leave empty for GitHub's runner image. Any Linux arm64 image with bash works; see the README for requirements.")
+                            Text(containerEngine == .docker
+                                ? "Container image. Leave empty for GitHub's runner image. Local images work too; see the README for requirements."
+                                : "Container image. Leave empty for GitHub's runner image. Any Linux arm64 image with bash works; see the README for requirements.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -207,8 +220,21 @@ struct AddRunnerView: View {
                                 Text("Enable GUI Access")
                                     .font(.subheadline)
                                 Text(selectedIsolation == .container
-                                    ? "Give this runner its own virtual display (Xvfb) inside its VM (default: headless)"
+                                    ? "Give this runner its own virtual display (Xvfb) inside its \(containerEngine == .docker ? "container" : "VM") (default: headless)"
                                     : "Allow runner to access display (default: headless)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+
+                    // Single-use (JIT) registrations
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle(isOn: $jit) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Single-Use Runners (JIT)")
+                                    .font(.subheadline)
+                                Text("Register a new runner with a fresh workspace for each job, and delete it afterwards. It gets only the labels above, so include self-hosted and the OS if workflows ask for them.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -519,6 +545,9 @@ struct AddRunnerView: View {
                 enableGUI: enableGUI,
                 openFileLimit: openFileLimit,
                 containerImage: selectedIsolation == .container ? containerImage : nil,
+                // Apple's engine is stored as nil, as before engines existed.
+                containerEngine: selectedIsolation == .container && containerEngine == .docker ? .docker : nil,
+                jit: jit,
                 onProgress: { current, total in
                     addingProgress = (current: current, total: total)
                 }

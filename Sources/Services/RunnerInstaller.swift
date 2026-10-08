@@ -13,9 +13,18 @@ class RunnerInstaller {
 
     private let session = URLSession.shared
 
+    /// How long a version GitHub reported is reused. Container runners look it
+    /// up at every start, which for a JIT runner is every job, and GitHub's
+    /// unauthenticated API allows 60 requests an hour.
+    static let resolvedVersionLifetime: TimeInterval = 3600
+    private let resolvedVersion = ResolvedVersionCache()
+
     /// Resolve the runner version to install: the latest actions/runner release,
     /// or `fallbackRunnerVersion` if the lookup fails or returns something older.
     func resolveRunnerVersion() async -> String {
+        if let cached = resolvedVersion.value(maxAge: Self.resolvedVersionLifetime) {
+            return cached
+        }
         var request = URLRequest(url: Self.latestReleaseURL, timeoutInterval: 15)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("mac-runner", forHTTPHeaderField: "User-Agent")
@@ -23,7 +32,11 @@ class RunnerInstaller {
         do {
             let (data, response) = try await session.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            return Self.runnerVersion(fromLatestReleaseData: data, statusCode: statusCode)
+            let version = Self.runnerVersion(fromLatestReleaseData: data, statusCode: statusCode)
+            if statusCode == 200 {
+                resolvedVersion.store(version)
+            }
+            return version
         } catch {
             print("Could not resolve latest runner version (\(error.localizedDescription)); using \(Self.fallbackRunnerVersion)")
             return Self.fallbackRunnerVersion
@@ -259,15 +272,7 @@ class RunnerInstaller {
         runnerId: UUID,
         isolation: IsolationMode = .none
     ) async throws -> String {
-        let directory = try RunnerDirectory.path(for: runnerId, isolation: isolation)
-
-        // Install runner binary
-        try await installRunner(to: directory, isolation: isolation)
-
-        // When isolated, chown the extracted runner to the service user
-        if case .dedicatedUser(let username) = isolation {
-            try RunnerDirectory.createDirectoryWithSudo(at: directory, owner: username)
-        }
+        let directory = try await prepareRunner(runnerId: runnerId, isolation: isolation)
 
         // Configure with GitHub
         try await configureRunner(
@@ -279,6 +284,22 @@ class RunnerInstaller {
             isolation: isolation
         )
 
+        return directory
+    }
+
+    /// Download the runner into its directory without registering it, as JIT
+    /// runners need: they register at each start, from a JIT config.
+    @discardableResult
+    func prepareRunner(runnerId: UUID, isolation: IsolationMode = .none) async throws -> String {
+        let directory = try RunnerDirectory.path(for: runnerId, isolation: isolation)
+
+        // Install runner binary
+        try await installRunner(to: directory, isolation: isolation)
+
+        // When isolated, chown the extracted runner to the service user
+        if case .dedicatedUser(let username) = isolation {
+            try RunnerDirectory.createDirectoryWithSudo(at: directory, owner: username)
+        }
         return directory
     }
 
@@ -328,6 +349,23 @@ class RunnerInstaller {
     private func makeExecutable(_ path: String) throws {
         let attributes = [FileAttributeKey.posixPermissions: 0o755]
         try FileManager.default.setAttributes(attributes, ofItemAtPath: path)
+    }
+}
+
+/// The last runner version GitHub reported, and when.
+final class ResolvedVersionCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entry: (version: String, at: Date)?
+
+    func value(maxAge: TimeInterval, now: Date = Date()) -> String? {
+        lock.withLock {
+            guard let entry, now.timeIntervalSince(entry.at) < maxAge else { return nil }
+            return entry.version
+        }
+    }
+
+    func store(_ version: String, at date: Date = Date()) {
+        lock.withLock { entry = (version, date) }
     }
 }
 

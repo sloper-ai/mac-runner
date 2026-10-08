@@ -42,6 +42,31 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     /// Container isolation: tools chosen when the runner was created, installed
     /// each time its container starts.
     var containerTools: [String]?
+    /// Container isolation: the engine that runs the container (nil = `.apple`).
+    var containerEngine: ContainerEngine?
+    /// Container isolation: CPUs and memory (in MB) for the container
+    /// (nil = `ResourceLimits.defaultContainerCPUs` and `defaultContainerMemoryMB`).
+    var containerCPUs: Int?
+    var containerMemoryMB: Int?
+    /// Just-in-time (single-use) registration: each start registers a new
+    /// runner for one job from a JIT config, with a fresh workspace, and that
+    /// registration is deleted when it exits. nil = false: one long-lived
+    /// registration, as before JIT runners existed.
+    var jit: Bool?
+    /// A JIT runner's current registration on GitHub, while it has one. Its
+    /// ID is also `githubRunnerId`.
+    var jitRegistration: JITRegistration?
+    /// Container isolation: the tools to install each time the container
+    /// starts, in place of those detected when the runner was created
+    /// (`containerTools`). [] installs nothing (`--no-tools`); nil uses the
+    /// detected ones.
+    var containerToolsOverride: [String]?
+    /// Docker engine: container paths backed by named volumes that outlive
+    /// each container (package caches, say), so they survive across jobs.
+    var containerCachePaths: [String]?
+    /// Docker engine: give jobs their own Docker daemon (Docker-in-Docker) in a
+    /// privileged container, its images kept in a volume across jobs. nil = off.
+    var dockerInDocker: Bool?
 
     init(
         id: UUID = UUID(),
@@ -58,7 +83,14 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         lastRestartEvent: String? = nil,
         openFileLimit: Int? = nil,
         quietHours: QuietHours? = nil,
-        autoPauseReason: AutoPauseReason? = nil
+        autoPauseReason: AutoPauseReason? = nil,
+        containerEngine: ContainerEngine? = nil,
+        containerCPUs: Int? = nil,
+        containerMemoryMB: Int? = nil,
+        jit: Bool? = nil,
+        containerToolsOverride: [String]? = nil,
+        containerCachePaths: [String]? = nil,
+        dockerInDocker: Bool? = nil
     ) {
         self.id = id
         self.name = name
@@ -75,6 +107,13 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         self.openFileLimit = ResourceLimits.normalizedOpenFileLimit(openFileLimit)
         self.quietHours = quietHours
         self.autoPauseReason = autoPauseReason
+        self.containerEngine = containerEngine
+        self.containerCPUs = containerCPUs
+        self.containerMemoryMB = containerMemoryMB
+        self.jit = jit == true ? true : nil
+        self.containerToolsOverride = containerToolsOverride
+        self.containerCachePaths = containerCachePaths.flatMap { $0.isEmpty ? nil : $0 }
+        self.dockerInDocker = dockerInDocker == true ? true : nil
     }
 
     init(from decoder: Decoder) throws {
@@ -104,6 +143,16 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         autoPauseOverride = try container.decodeIfPresent(AutoPauseReason.self, forKey: .autoPauseOverride)
         containerImage = try container.decodeIfPresent(String.self, forKey: .containerImage)
         containerTools = try container.decodeIfPresent([String].self, forKey: .containerTools)
+        // Configs written before the Docker engine existed have Apple's (nil).
+        containerEngine = try container.decodeIfPresent(ContainerEngine.self, forKey: .containerEngine)
+        containerCPUs = try container.decodeIfPresent(Int.self, forKey: .containerCPUs)
+        containerMemoryMB = try container.decodeIfPresent(Int.self, forKey: .containerMemoryMB)
+        // Configs written before JIT runners existed have long-lived ones (nil).
+        jit = try container.decodeIfPresent(Bool.self, forKey: .jit) == true ? true : nil
+        jitRegistration = try container.decodeIfPresent(JITRegistration.self, forKey: .jitRegistration)
+        containerToolsOverride = try container.decodeIfPresent([String].self, forKey: .containerToolsOverride)
+        containerCachePaths = try container.decodeIfPresent([String].self, forKey: .containerCachePaths)
+        dockerInDocker = try container.decodeIfPresent(Bool.self, forKey: .dockerInDocker) == true ? true : nil
     }
 
     /// User-editable settings, compared when reconciling concurrent config edits.
@@ -120,6 +169,15 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         var quietHours: QuietHours?
         var containerImage: String?
         var containerTools: [String]?
+        var containerEngine: ContainerEngine?
+        var containerCPUs: Int?
+        var containerMemoryMB: Int?
+        var jit: Bool?
+        /// Changes with `githubRunnerId` (each JIT start), so the two travel together.
+        var jitRegistration: JITRegistration?
+        var containerToolsOverride: [String]?
+        var containerCachePaths: [String]?
+        var dockerInDocker: Bool?
     }
 
     var configuration: Configuration {
@@ -128,7 +186,12 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
                 name: name, repo: repo, scope: scope, labels: labels, enabled: enabled,
                 githubRunnerId: githubRunnerId, isolationMode: isolationMode, enableGUI: enableGUI,
                 openFileLimit: openFileLimit, quietHours: quietHours,
-                containerImage: containerImage, containerTools: containerTools
+                containerImage: containerImage, containerTools: containerTools,
+                containerEngine: containerEngine,
+                containerCPUs: containerCPUs, containerMemoryMB: containerMemoryMB,
+                jit: jit, jitRegistration: jitRegistration,
+                containerToolsOverride: containerToolsOverride, containerCachePaths: containerCachePaths,
+                dockerInDocker: dockerInDocker
             )
         }
         set {
@@ -144,6 +207,14 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
             quietHours = newValue.quietHours
             containerImage = newValue.containerImage
             containerTools = newValue.containerTools
+            containerEngine = newValue.containerEngine
+            containerCPUs = newValue.containerCPUs
+            containerMemoryMB = newValue.containerMemoryMB
+            jit = newValue.jit
+            jitRegistration = newValue.jitRegistration
+            containerToolsOverride = newValue.containerToolsOverride
+            containerCachePaths = newValue.containerCachePaths
+            dockerInDocker = newValue.dockerInDocker
         }
     }
 
@@ -186,6 +257,68 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         return isolationMode ?? globalMode
     }
 
+    /// The engine that runs this runner's container: its own, else Apple's.
+    var effectiveContainerEngine: ContainerEngine {
+        containerEngine ?? .apple
+    }
+
+    /// Whether this runner runs in Docker: container isolation on the Docker engine.
+    func runsInDocker(global globalMode: IsolationMode) -> Bool {
+        effectiveIsolationMode(global: globalMode) == .container && effectiveContainerEngine == .docker
+    }
+
+    /// `isolation`'s name as shown for this runner: container runners on
+    /// Docker name their engine, e.g. "Container (Docker)".
+    func isolationDisplayName(for isolation: IsolationMode) -> String {
+        guard isolation == .container, effectiveContainerEngine == .docker else { return isolation.displayName }
+        return "\(isolation.displayName) (\(ContainerEngine.docker.displayName))"
+    }
+
+    /// CPUs the runner's container gets: its own count, else the default.
+    var effectiveContainerCPUs: Int {
+        containerCPUs ?? ResourceLimits.defaultContainerCPUs
+    }
+
+    /// Memory the runner's container gets, in MB: its own, else the default.
+    var effectiveContainerMemoryMB: Int {
+        containerMemoryMB ?? ResourceLimits.defaultContainerMemoryMB
+    }
+
+    /// The container's CPUs and memory, e.g. "4 CPUs, 8 GB".
+    var containerResourcesDescription: String {
+        let cpus = effectiveContainerCPUs == 1 ? "1 CPU" : "\(effectiveContainerCPUs) CPUs"
+        return "\(cpus), \(ResourceLimits.memoryDescription(megabytes: effectiveContainerMemoryMB))"
+    }
+
+    /// `containerResourcesDescription` when either differs from the default;
+    /// nil otherwise.
+    var containerResourcesSummary: String? {
+        guard effectiveContainerCPUs != ResourceLimits.defaultContainerCPUs
+                || effectiveContainerMemoryMB != ResourceLimits.defaultContainerMemoryMB else { return nil }
+        return containerResourcesDescription
+    }
+
+    /// Whether each start registers a single-use (JIT) runner.
+    var isJIT: Bool {
+        jit == true
+    }
+
+    /// The name GitHub knows the running runner by: a JIT runner's current
+    /// registration (`<name>-<6 hex>`), else the runner's own name.
+    var registeredName: String {
+        jitRegistration?.name ?? name
+    }
+
+    /// Container isolation: the tools installed each time its container starts.
+    var effectiveContainerTools: [String] {
+        containerToolsOverride ?? containerTools ?? []
+    }
+
+    /// Whether its jobs get Docker of their own: on, for a runner on the Docker engine.
+    func usesDockerInDocker(global globalMode: IsolationMode) -> Bool {
+        dockerInDocker == true && runsInDocker(global: globalMode)
+    }
+
     func effectiveOpenFileLimit(global globalLimit: Int) -> Int {
         openFileLimit ?? globalLimit
     }
@@ -194,6 +327,16 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     func effectiveQuietHours(global globalQuietHours: QuietHours?) -> QuietHours? {
         quietHours ?? globalQuietHours
     }
+}
+
+/// One start's single-use (JIT) runner registration on GitHub.
+struct JITRegistration: Codable, Sendable, Equatable {
+    /// GitHub's runner ID, deleted when the runner exits or is stopped.
+    var id: Int
+    /// The name it's registered under: the runner's name and 6 random hex digits.
+    var name: String
+    /// When it was registered; the runner was launched right after.
+    var createdAt: Date
 }
 
 /// A scope-aware identifier for GitHub Actions runner registration targets.
@@ -267,7 +410,7 @@ struct RunnerConfig: Codable, Sendable, Equatable {
 enum IsolationMode: Codable, Sendable, Equatable {
     case none
     case dedicatedUser(username: String)
-    case container  // Container isolation via Apple Containerization framework (macOS 26+)
+    case container  // Linux container isolation; each runner's `ContainerEngine` runs it
 
     static let defaultUsername = "_macrunner"
 
@@ -323,6 +466,24 @@ enum IsolationMode: Codable, Sendable, Equatable {
             return "👤"
         case .container:
             return "📦"
+        }
+    }
+}
+
+/// What runs a container-isolated runner's Linux container.
+enum ContainerEngine: String, Codable, Sendable, CaseIterable {
+    /// Apple's Containerization framework: a lightweight VM per runner, hosted
+    /// by the Mac Runner process that started it (macOS 26+, Apple Silicon).
+    case apple
+    /// A Docker container (Docker Desktop, OrbStack, Colima, …), run by a
+    /// background `docker run` that outlives the process that started it. The
+    /// work directory is a Docker volume, and images can be local.
+    case docker
+
+    var displayName: String {
+        switch self {
+        case .apple: return "Apple"
+        case .docker: return "Docker"
         }
     }
 }

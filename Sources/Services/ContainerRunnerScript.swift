@@ -5,7 +5,8 @@ import Foundation
 /// Inputs arrive as `MR_*` environment variables rather than being spliced
 /// into the script, so names, labels, and tokens need no shell quoting.
 enum ContainerRunnerScript {
-    /// Where the host's `_work` and `_diag` directories are mounted.
+    /// Where the runner's work directory (the host's `_work`, or a Docker
+    /// volume) and the host's `_diag` directory are mounted.
     static let workMount = "/mac-runner/_work"
     static let diagnosticsMount = "/mac-runner/_diag"
 
@@ -144,17 +145,94 @@ enum ContainerRunnerScript {
       ln -s "$MR_DIAG_DIR" "$RUNNER_HOME/_diag"
     fi
 
+    # Cache volumes outlive the container. Docker creates a mount point (and any
+    # missing parent) owned by root: make them this user's, parents within $HOME too.
+    if [ -n "${MR_CACHE_DIRS:-}" ]; then
+      IFS=: read -r -a cache_dirs <<< "$MR_CACHE_DIRS"
+      for dir in "${cache_dirs[@]}"; do
+        [ -n "$dir" ] || continue
+        if ! ensure_dir "$dir" || [ ! -w "$dir" ]; then
+          log "ERROR: the cache $dir isn't writable by $(id -un), and sudo couldn't fix that."
+          exit 1
+        fi
+        parent="$(dirname "$dir")"
+        while [ -n "${HOME:-}" ] && [ "$parent" != "$HOME" ] && [ "${parent#"$HOME"/}" != "$parent" ]; do
+          [ -w "$parent" ] || $SUDO chown "$(id -u):$(id -g)" "$parent" 2>/dev/null \
+            || log "Warning: $parent isn't writable by $(id -un)"
+          parent="$(dirname "$parent")"
+        done
+      done
+    fi
+
+    # Docker-in-Docker: this runner's own Docker daemon, for its jobs. Without it,
+    # or if it won't come up, the runner isn't started: its jobs expect Docker.
+    if [ "${MR_DOCKER:-0}" = 1 ]; then
+      as_root() { if [ -n "$SUDO" ]; then $SUDO -n "$@"; else "$@"; fi; }
+      fail_docker() {
+        log "ERROR: $1 Not starting the runner so jobs don't run without Docker."
+        exit 1
+      }
+      command -v dockerd >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 \
+        || fail_docker "Docker-in-Docker needs dockerd and the docker CLI in the image (docker-ce, or docker.io on Debian and Ubuntu)."
+      docker_socket="${MR_DOCKER_SOCKET:-/var/run/docker.sock}"
+      docker_log="${MR_DOCKER_LOG:-/tmp/dockerd.log}"
+      # cgroup v2: move this container's processes into a child cgroup, so the
+      # daemon can hand controllers to its own containers (as Docker's dind does).
+      if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        as_root sh -c 'mkdir -p /sys/fs/cgroup/init && xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null; sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control' 2>/dev/null \
+          || log "Warning: couldn't delegate cgroup controllers; Docker's containers may not start"
+      fi
+      log "Starting Docker for this runner's jobs (log: $docker_log)"
+      as_root dockerd >"$docker_log" 2>&1 &
+      dockerd_pid=$!
+      docker_up=""
+      for _ in $(seq 1 "${MR_DOCKER_WAIT:-30}"); do
+        if as_root docker info >/dev/null 2>&1; then docker_up=1; break; fi
+        kill -0 "$dockerd_pid" 2>/dev/null || break
+        sleep 1
+      done
+      if [ -z "$docker_up" ]; then
+        tail -n 20 "$docker_log" 2>/dev/null | sed 's/^/[dockerd] /' || true
+        if kill -0 "$dockerd_pid" 2>/dev/null; then
+          fail_docker "the Docker daemon didn't answer within ${MR_DOCKER_WAIT:-30}s (its log is above)."
+        fi
+        fail_docker "the Docker daemon exited (its log is above). It needs a privileged container, and an image user that's root or has passwordless sudo."
+      fi
+      # Usable by this user and its jobs. Joining the socket's group now wouldn't
+      # reach processes already running, so open the socket (in this container only).
+      if [ ! -w "$docker_socket" ]; then
+        as_root chmod 666 "$docker_socket" || fail_docker "couldn't make $docker_socket usable by $(id -un)."
+      fi
+      # The previous job's containers go, running ones too (a restart policy brings
+      # them back), with their anonymous volumes. Images stay cached.
+      leftovers="$(docker ps -aq 2>/dev/null || true)"
+      if [ -n "$leftovers" ]; then
+        # shellcheck disable=SC2086
+        docker rm -f -v $leftovers >/dev/null || log "Warning: couldn't remove the previous job's containers"
+      fi
+      docker container prune -f >/dev/null 2>&1 || true
+      log "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '(unknown version)') is up for this runner's jobs"
+    fi
+
     cd "$RUNNER_HOME"
-    ./config.sh --unattended --replace \
-      --url "$MR_URL" --token "$MR_TOKEN" \
-      --name "$MR_NAME" --labels "$MR_LABELS" --work "$MR_WORK_DIR"
-    unset MR_TOKEN
+    if [ -n "${ACTIONS_RUNNER_INPUT_JITCONFIG:-}" ]; then
+      # Single-use runner: it registers itself from the JIT config in its
+      # environment (the runner reads ACTIONS_RUNNER_INPUT_JITCONFIG like
+      # --jitconfig), so there's no config.sh.
+      log "Starting a single-use (JIT) runner"
+    else
+      ./config.sh --unattended --replace \
+        --url "$MR_URL" --token "$MR_TOKEN" \
+        --name "$MR_NAME" --labels "$MR_LABELS" --work "$MR_WORK_DIR"
+      unset MR_TOKEN
+    fi
     ulimit -n "$MR_OPEN_FILES" 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
     exec ./run.sh
     """#
 
-    /// X display for GUI-enabled container runners. Each runner has its own VM,
-    /// so every runner gets a separate display even though the name is shared.
+    /// X display for GUI-enabled container runners. Each runner has its own VM
+    /// or container, so every runner gets a separate display even though the
+    /// name is shared.
     static let displayName = ":99"
 
     /// DNS-safe hostname for a runner's container.
@@ -185,22 +263,74 @@ enum ContainerRunnerScript {
         return (packages.filter { seen.insert($0).inserted }, installGitHubCLI)
     }
 
-    static func environment(for config: ContainerRunnerConfiguration) -> [String] {
-        let apt = aptPackages(for: config.tools)
-        return [
-            "RUNNER_ALLOW_RUNASROOT=1",
-            "MR_URL=\(config.repositoryURL)",
-            "MR_TOKEN=\(config.registrationToken)",
-            "MR_NAME=\(config.runnerName)",
-            "MR_LABELS=\(config.labels.joined(separator: ","))",
-            "MR_RUNNER_URL=\(config.runnerDownloadURL)",
-            "MR_OPEN_FILES=\(config.openFileLimit)",
-            "MR_WORK_DIR=\(workMount)",
-            "MR_DIAG_DIR=\(diagnosticsMount)",
-            "MR_APT_PACKAGES=\(apt.packages.joined(separator: " "))",
-            "MR_INSTALL_GH=\(apt.installGitHubCLI ? 1 : 0)",
-            "MR_ENABLE_GUI=\(config.enableGUI ? 1 : 0)",
-            "MR_DISPLAY=\(displayName)",
+    /// How the runner in the container registers.
+    enum Registration: Equatable {
+        /// With `config.sh` and a registration token (`MR_TOKEN`), as a long-lived runner.
+        case token(String)
+        /// As a single-use runner, from a JIT config in `ACTIONS_RUNNER_INPUT_JITCONFIG`
+        /// (the runner reads it like `--jitconfig`); `config.sh` is skipped.
+        case jitConfig(String)
+
+        var variable: (name: String, value: String) {
+            switch self {
+            case .token(let token): return ("MR_TOKEN", token)
+            case .jitConfig(let config): return (JITRunner.configVariable, config)
+            }
+        }
+    }
+
+    /// The script's inputs, in a fixed order: the container environment both
+    /// engines give it. Values are passed as they are, never through a shell.
+    /// `cacheDirectories` (Docker cache volumes) and `MR_DOCKER` (Docker-in-Docker)
+    /// are only listed when used, so other runners get the same inputs as before.
+    static func variables(
+        registrationURL: String,
+        registration: Registration,
+        runnerName: String,
+        labels: [String],
+        runnerDownloadURL: String,
+        openFileLimit: Int,
+        tools: [String],
+        enableGUI: Bool,
+        cacheDirectories: [String] = [],
+        dockerInDocker: Bool = false
+    ) -> [(name: String, value: String)] {
+        let apt = aptPackages(for: tools)
+        var variables = [
+            ("RUNNER_ALLOW_RUNASROOT", "1"),
+            ("MR_URL", registrationURL),
+            registration.variable,
+            ("MR_NAME", runnerName),
+            ("MR_LABELS", labels.joined(separator: ",")),
+            ("MR_RUNNER_URL", runnerDownloadURL),
+            ("MR_OPEN_FILES", String(openFileLimit)),
+            ("MR_WORK_DIR", workMount),
+            ("MR_DIAG_DIR", diagnosticsMount),
+            ("MR_APT_PACKAGES", apt.packages.joined(separator: " ")),
+            ("MR_INSTALL_GH", apt.installGitHubCLI ? "1" : "0"),
+            ("MR_ENABLE_GUI", enableGUI ? "1" : "0"),
+            ("MR_DISPLAY", displayName),
         ]
+        if !cacheDirectories.isEmpty {
+            // Cache paths can't contain ':' (see DockerRunnerEngine.cachePaths).
+            variables.append(("MR_CACHE_DIRS", cacheDirectories.joined(separator: ":")))
+        }
+        if dockerInDocker {
+            variables.append(("MR_DOCKER", "1"))
+        }
+        return variables
+    }
+
+    static func environment(for config: ContainerRunnerConfiguration) -> [String] {
+        variables(
+            registrationURL: config.repositoryURL,
+            registration: config.jitConfig.map(Registration.jitConfig) ?? .token(config.registrationToken),
+            runnerName: config.runnerName,
+            labels: config.labels,
+            runnerDownloadURL: config.runnerDownloadURL,
+            openFileLimit: config.openFileLimit,
+            tools: config.tools,
+            enableGUI: config.enableGUI
+        ).map { "\($0.name)=\($0.value)" }
     }
 }

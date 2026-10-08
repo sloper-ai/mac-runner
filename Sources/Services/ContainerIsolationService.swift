@@ -417,6 +417,10 @@ struct ContainerRunnerConfiguration {
     /// Registration token for the runner.
     var registrationToken: String
 
+    /// A single-use runner's JIT config, used instead of the token: the runner
+    /// reads it from its environment and `config.sh` is skipped.
+    var jitConfig: String? = nil
+
     /// Name and labels the runner registers with.
     var runnerName: String
     var labels: [String]
@@ -440,6 +444,11 @@ struct ContainerRunnerConfiguration {
     /// Default container image: GitHub's official runner image, which ships the
     /// Actions runner in /home/runner. (`ghcr.io/actions/runner` doesn't exist.)
     static let defaultRunnerImage = "ghcr.io/actions/actions-runner:latest"
+
+    /// CPUs and memory for `runner`'s VM: its own, else 2 CPUs and 4 GiB.
+    static func resources(for runner: Runner) -> (cpuCount: Int, memoryInBytes: UInt64) {
+        (runner.effectiveContainerCPUs, .mib(runner.effectiveContainerMemoryMB))
+    }
 }
 
 // MARK: - Helper Extensions

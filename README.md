@@ -1,8 +1,9 @@
 # Mac Runner
 
 > **This is sloper-ai's fork of [omniaura/mac-runner](https://github.com/omniaura/mac-runner).**
-> It adds a Docker engine for container runners, with more features to come. Releases,
-> the Homebrew tap and in-app updates all come from this repository.
+> It adds a [Docker engine](#docker-engine) for container runners, with [Docker-in-Docker](#docker-for-jobs-docker-in-docker)
+> for their jobs, and [just-in-time runners](#just-in-time-runners): a single-use registration and a fresh
+> workspace for every job. Releases, the Homebrew tap and in-app updates all come from this repository.
 
 Simple Mac menu bar app and CLI for managing GitHub Actions self-hosted runners.
 
@@ -24,8 +25,10 @@ Simple Mac menu bar app and CLI for managing GitHub Actions self-hosted runners.
 - 📜 **Log viewer**: live-tail, filter, and export runner output and diagnostics (`mac-runner logs <name> --follow`), with log rotation
 - 🪟 **Dashboard window**: every runner's status, current job, recent jobs, resources, and logs in one window
 - 🔔 **Job notifications**: native notifications when jobs start and finish (caught from each runner's own log, so even jobs of a few seconds show up), and an animated menu bar icon while any runner is executing
-- 📦 **Custom container images**: run Linux runners on your own OCI images (linux/arm64 with `bash`; see [Container Isolation](#3-container-isolation-macos-26-apple-silicon) for requirements), each with its own virtual display when GUI access is on
+- 📦 **Custom container images**: run Linux runners on your own OCI images (linux/arm64 with `bash`; see [Container Isolation](#3-container-isolation-linux-runners) for requirements), each with its own virtual display when GUI access is on
+- 🐳 **Docker engine**: run Linux container runners in Docker (Docker Desktop, OrbStack, Colima) instead of Apple's Containerization, with local images and the work directory in a Docker volume; set each container's CPUs and memory on either engine, and give jobs Docker of their own ([Docker-in-Docker](#docker-for-jobs-docker-in-docker))
 - 🗂️ **Declarative config**: describe runners in `.mac-runner.yml` and `mac-runner apply` them (`mac-runner export` to start)
+- ♻️ **Just-in-time runners**: a single-use registration and a fresh workspace for every job, deleted afterwards, with optional cache volumes that outlive them ([Just-in-time Runners](#just-in-time-runners))
 
 ## Why?
 
@@ -74,9 +77,9 @@ xattr -dr com.apple.quarantine /Applications/MacRunner.app
 
 ### Prerequisites
 
-- macOS 13+ (macOS 15+ for user isolation, macOS 26+ for container isolation)
+- macOS 13+ (macOS 15+ for user isolation, macOS 26+ for container isolation with Apple's engine)
 - [`gh` CLI](https://cli.github.com/) installed and authenticated (`gh auth login`)
-- Apple Silicon Mac (for container isolation)
+- Apple Silicon Mac (for container isolation with Apple's engine), or Docker (for its [Docker engine](#docker-engine))
 
 ## Quick Start
 
@@ -203,6 +206,14 @@ runners:
   - name: linux-builder
     org: omniaura
     isolation: container           # none | user | container | global (default: global)
+    engine: docker                 # container isolation: apple | docker (default: apple)
+    image: my-ci-image:latest      # container isolation (default: ghcr.io/actions/actions-runner:latest)
+    cpus: 4                        # container isolation (default: 2)
+    memory: 8g                     # container isolation: 8g, 8192m, or MB (default: 4g)
+    jit: true                      # a single-use registration per job (default: false)
+    tools: []                      # container isolation: tools to install at start; [] = none (default: detected)
+    cache: [/home/runner/.cargo/registry]   # Docker engine: container paths kept in volumes across jobs
+    docker: true                   # Docker engine: Docker for jobs, Docker-in-Docker (default: false)
     enable-gui: false              # default: false (headless)
     open-files: 65536              # default: the global limit
     quiet-hours: never             # never | { start, end } (default: global schedule)
@@ -214,9 +225,65 @@ Runners are matched by name. What happens to an existing runner depends on what 
 |---|---|
 | New name | Registers and starts the runner |
 | `repo`/`org`, `labels`, or `isolation` | Unregisters and registers the runner again |
-| `enable-gui` or `open-files` | Updates it, restarting it if it's running |
+| `enable-gui`, `open-files`, `image`, `engine`, `cpus`, `memory`, `jit`, `tools`, `cache`, or `docker` | Updates it, restarting it if it's running |
 | `quiet-hours` | Updates it in place |
 | Name no longer in the file | Unregisters it and deletes its workspace (unless `--no-prune`) |
+
+A restart never interrupts a job: the change applies when the runner next starts (for a JIT runner, from its next job). An `engine` or `jit` change is the exception, since a runner must stop the way it started (stopping a JIT runner deletes its registration; stopping a long-lived one doesn't): while a job runs it's left for later, so run `apply` again once the runner is idle.
+
+## Just-in-time Runners
+
+A just-in-time (JIT) runner registers a new, single-use runner with GitHub each time it starts, runs one job on it, and deletes it. Every job gets a fresh registration and a fresh workspace, and Mac Runner cleans up after each one, so nothing a job leaves behind reaches the next, and no stale runners pile up in the repository's settings. GitHub-hosted runners and Actions Runner Controller work the same way.
+
+Use it when:
+- jobs shouldn't see what earlier jobs left: checkouts, build output, files under `_work/_temp`, anything a step wrote into the workspace;
+- you run workflows you don't fully trust (pull requests from forks, say), together with [user or container isolation](#isolation-modes);
+- jobs should all start from the same state, so none passes only because an earlier one left something behind.
+
+The cost is a few seconds per job (a registration, plus a container start on the container engines), and whatever a job needs from the workspace is fetched again, `actions/setup-*` tool caches included, unless you keep it in a [cache volume](#cache-volumes-docker).
+
+```bash
+# Every isolation mode can use it
+mac-runner add owner/repo --isolation user --jit --labels self-hosted,macOS,ARM64
+mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --jit \
+  --labels self-hosted,Linux,ARM64 --no-tools \
+  --cache /home/runner/.cargo/registry --cache /home/runner/.cache/uv
+```
+
+In a [config file](#declarative-configuration), set `jit: true` on the runner (and `tools`, `cache` as below); `apply` switches an existing runner over in place, restarting it. In the GUI: Add Runner → Single-Use Runners (JIT).
+
+**Labels.** GitHub gives a JIT runner exactly the labels it's registered with: unlike `config.sh`, it adds no `self-hosted`, OS, or architecture labels. List every label your workflows' `runs-on` asks for, e.g. `--labels self-hosted,Linux,ARM64`.
+
+**How it runs.**
+- At each start, Mac Runner asks GitHub for a JIT config (`POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig`, or the organization's) for a runner named `<name>-<6 hex digits>` in the default runner group, with the runner's labels, and records its ID (`githubRunnerId`).
+- The JIT config is the runner's credentials. It reaches the runner in `ACTIONS_RUNNER_INPUT_JITCONFIG`, which the runner reads like `--jitconfig` (and then removes from its own environment), so it's never in a command line or `ps`, and Mac Runner never logs it. Docker and Apple's engine put it in the container's environment (Docker by name only: `-e ACTIONS_RUNNER_INPUT_JITCONFIG`); without isolation it's in the runner's environment. A dedicated user's runner is started by `sudo`, which clears the environment, so its config goes to a file only that user can read (mode 0600, written from stdin), which the launch reads into the variable and deletes before starting `run.sh`.
+- Once its job is done the runner exits, and Mac Runner deletes the registration and starts the next one right away. That's not a crash. A crash is, and so is an exit within 30 seconds that ran no job (a rejected config, say): the usual auto-restart backoff and retry limit apply.
+- The menu bar app keeps JIT runners going whatever started them: when a runner started by `mac-runner add`, `start`, or `apply` exits after its job, the app registers and starts the next one. Keep the app running; the CLI says so when it starts a JIT runner while the app isn't. (A container runner on Apple's engine lives in the process that started it, which handles its exits itself.)
+- `mac-runner list` and `status` mark JIT runners, and `status` shows each one's current registration. Between jobs, while its next registration is made, a JIT runner still shows as running.
+
+**Cleanup.**
+- After every exit, and on `mac-runner stop`, `remove`, and `uninstall`, Mac Runner deletes that start's registration (a 404 is fine: GitHub deletes a single-use runner itself once it has run a job). So a stopped JIT runner never leaves an idle registration behind. `remove` and `uninstall` also delete offline `<name>-<hex>` registrations left by earlier starts (if Mac Runner was killed mid-job, say).
+- Each start begins with an empty workspace. On Docker, the work volume (`mac-runner-<runner id>-work`) is deleted and created again before the container runs, and the runner doesn't start if it can't be. Apple's engine and the process modes delete `_work` (as the dedicated user, through Mac Runner's sudo rules). The previous registration's credential files (`.runner`, `.credentials`, `.credentials_rsaparams`) go too, and containers are removed when they exit (`docker run --rm`). The last job's workspace stays until the runner starts again or is removed.
+- `runner.log` and `_diag` stay as they are, with the usual rotation and pruning.
+
+### Cache Volumes (Docker)
+
+A fresh workspace means fresh downloads, but package caches are worth keeping. On the Docker engine, `--cache <container path>` (repeatable) or `cache: [...]` in a config file backs each path with a named volume, `mac-runner-<runner id>-cache-<8 hex digits of the path's hash>`, that outlives the container. Docker fills a new volume with whatever the image has at that path, and Mac Runner makes the path writable by the image's user (with `sudo` where needed), along with any parent directory Docker had to create in that user's home. Removing the runner (or uninstalling) deletes its cache volumes; to empty one, stop the runner and `docker volume rm` it. Paths are absolute paths in the container, outside `/mac-runner`. Apple's engine doesn't support them.
+
+Good candidates, for an image whose user is `runner`:
+
+| Tool | Paths |
+| --- | --- |
+| Cargo | `/home/runner/.cargo/registry`, `/home/runner/.cargo/git` |
+| Go | `/home/runner/go/pkg/mod` (modules), `/home/runner/.cache/go-build` (build cache) |
+| uv | `/home/runner/.cache/uv` (uv copies from it instead of hard-linking across volumes; `UV_LINK_MODE=copy` quiets its warning) |
+| pnpm | `/home/runner/.local/share/pnpm/store`, with the store set to that absolute path in the workflow (`pnpm config set store-dir /home/runner/.local/share/pnpm/store`): by default pnpm keeps its store on the project's filesystem, which here is the work volume, emptied for every job |
+
+Cache what a tool downloads, not the tool: a volume keeps the first contents it got, so caching all of `~/.cargo` would freeze the toolchain the image ships.
+
+### Skipping Tool Installation
+
+Container runners install the GitHub CLI, the toolchains detected in the repository, and Settings → **Extra CI Tools** with `apt-get` each time their container starts; for a JIT runner, that's before every job. If the image already has its tools, `--no-tools` on `mac-runner add` (`tools: []` in a config file) installs nothing. `tools: [gh, jq]` installs just those (tool names as above, or apt packages); leaving `tools` out keeps detecting them, as before.
 
 ## CI/CD: Self-Hosted Runner with Automatic Cloud Fallback
 
@@ -298,10 +365,10 @@ Mac Runner supports three isolation modes to protect your development environmen
   Settings → Isolation Mode → Dedicated User
   ```
 
-### 3. Container Isolation (macOS 26+, Apple Silicon)
-- Runs each runner as a **Linux** (arm64) runner inside its own lightweight VM, using Apple's [Containerization framework](https://github.com/apple/containerization)
+### 3. Container Isolation (Linux runners)
+- Runs each runner as a **Linux** (arm64) runner inside its own lightweight VM, using Apple's [Containerization framework](https://github.com/apple/containerization), or in a Docker container with the [Docker engine](#docker-engine)
 - Best for Linux-based workflows and cross-platform testing
-- **Requirements:** macOS 26+, Apple Silicon, and a Linux kernel (see below)
+- **Requirements:** macOS 26+, Apple Silicon, and a Linux kernel (see below) for Apple's engine; a running Docker for the Docker engine
 - **How to enable:**
   ```bash
   # CLI (default image: GitHub's ghcr.io/actions/actions-runner:latest)
@@ -310,8 +377,11 @@ Mac Runner supports three isolation modes to protect your development environmen
   # With your own image
   mac-runner add owner/repo --isolation container --image ghcr.io/myorg/ci-image:latest
 
+  # In Docker, with more CPUs and memory
+  mac-runner add owner/repo --isolation container --engine docker --cpus 4 --memory 8g
+
   # GUI
-  Add Runner → Isolation Mode → Container (optionally set Container Image)
+  Add Runner → Isolation Mode → Container (optionally pick the Engine and set Container Image)
   ```
 
 **Kernel.** Mac Runner looks for a Linux kernel at `MacRunner.app/Contents/Resources/vmlinux` or `~/Library/Application Support/MacRunner/vmlinux`. The [Kata Containers](https://github.com/kata-containers/kata-containers/releases) kernel works:
@@ -327,11 +397,43 @@ cp -L opt/kata/share/kata-containers/vmlinux.container ~/Library/Application\ Su
 - `apt-get` (Debian/Ubuntu) if you want automatic tool installation. Other images still work; tools just aren't installed for you.
 - For GUI access: `Xvfb` preinstalled, or `apt-get` with a default user that is root or has passwordless `sudo` so Mac Runner can install it. Otherwise the runner doesn't start, rather than running GUI jobs without a display.
 
-**Tools.** When a container runner is created, Mac Runner picks the tools its jobs are likely to need: the GitHub CLI, toolchains detected from the repository (Node, Python, Go, Ruby, Rust), and any **Extra CI Tools** from Settings (installed as apt packages). They're installed with `apt-get` each time the runner's container starts, never per job.
+**Tools.** When a container runner is created, Mac Runner picks the tools its jobs are likely to need: the GitHub CLI, toolchains detected from the repository (Node, Python, Go, Ruby, Rust), and any **Extra CI Tools** from Settings (installed as apt packages). They're installed with `apt-get` each time the runner's container starts, never per job (for a [JIT runner](#just-in-time-runners), every start is a job). An image that has its tools can [skip this](#skipping-tool-installation) with `--no-tools`.
 
-**Lifetime.** A container runner's VM lives inside the process that started it. Start container runners from the menu bar app to keep them running in the background. `mac-runner add`/`start` for a container runner stays in the foreground and streams its output until you press Ctrl-C.
+**CPUs and memory.** Each container gets 2 CPUs and 4 GB unless its runner sets its own: `--cpus 4 --memory 8g` on `mac-runner add` (memory as `8g`, `8192m`, or a number of MB), or `cpus` and `memory` in a [config file](#declarative-configuration). CPUs can't exceed the Mac's cores, and memory must be at least `1g`. `mac-runner list` and `status` show them when they aren't the defaults.
+
+**Lifetime.** With Apple's engine, a container runner's VM lives inside the process that started it. Start container runners from the menu bar app to keep them running in the background. `mac-runner add`/`start` for a container runner stays in the foreground and streams its output until you press Ctrl-C. (Docker runners run in the background on their own; see below.)
 
 Container runners register with the name and labels you give them (default labels: `linux, mac-runner`). Their `runner.log` and `_diag` logs sit in the runner's directory like other modes (`mac-runner logs <name>`).
+
+#### Docker engine
+
+Container runners can run in Docker instead of Apple's Containerization, with Docker Desktop, OrbStack, Colima, or anything else that gives you a working `docker` CLI. Use it on Macs without macOS 26, to run images you've built locally, or when jobs need a real Linux filesystem for their work directory: Apple's engine shares `_work` from the Mac over virtio-fs, which refuses some files Linux tools create (GNU tar's mode-0 placeholder files, for one, so `actions/setup-node` can't extract Node there).
+
+```bash
+mac-runner add owner/repo --isolation container --engine docker
+mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest
+```
+
+In a config file, set `engine: docker` on the runner (`apple` is the default). In the GUI: Add Runner → Isolation Mode → Container → Engine: Docker.
+
+- **Images** come from Docker: an image you've built (`docker build -t my-ci-image .`) works without a registry, and others are pulled the first time a runner uses them. The image requirements above apply. If the image's user isn't root, it needs passwordless `sudo` (as GitHub's runner image has) to take over the work volume, which Docker creates owned by root.
+- **Work directory.** `_work` is the Docker volume `mac-runner-<runner id>-work` (shown in the dashboard), so checkouts and the tool cache survive restarts (a [JIT runner](#just-in-time-runners) empties it for every job, and can keep caches in [cache volumes](#cache-volumes-docker)). It's deleted with the runner by `mac-runner remove` and `mac-runner uninstall`; `mac-runner cleanup` leaves it alone (to empty it, stop the runner and `docker volume rm` it). `runner.log` and `_diag` stay in the runner's directory on the Mac, which Docker must be able to mount writable (Docker Desktop and OrbStack can by default).
+- **Lifetime.** A Docker runner is an ordinary background process, like a runner without isolation: `docker-run.sh` in its directory runs `docker run` in the foreground. It keeps running after `mac-runner add`/`start` returns and when the menu bar app quits. Stopping it stops and removes its container.
+- **Docker must be running** when the runner starts. At login, Mac Runner gives Docker up to two minutes to start before restarting Docker runners.
+- **CPUs and memory** are `docker run --cpus` and `--memory` limits, so Docker needs at least that many CPUs itself (Docker Desktop → Settings → Resources). A runner that asks for more than Docker has doesn't start; one on the defaults gets at most what Docker has.
+
+#### Docker for jobs (Docker-in-Docker)
+
+A runner on the Docker engine can give its jobs Docker of their own: `--docker` on `mac-runner add`, or `docker: true` in a [config file](#declarative-configuration). Its container then runs privileged with its own Docker daemon, so jobs can `docker build`, `docker run`, and `docker compose` as they would on GitHub's hosted runners. Use it only for workflows you trust: a privileged container controls the Docker VM it runs in, and through Docker's file sharing it can reach the Mac folders shared with Docker (`/Users`, by default, on Docker Desktop).
+
+```bash
+mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --docker
+```
+
+- **The image** needs Docker Engine (`dockerd` and the `docker` CLI: docker-ce, or docker.io on Debian and Ubuntu) and a user that's root or has passwordless `sudo`. If `dockerd` is missing or doesn't answer within 30 seconds, the runner doesn't start, and `runner.log` says why, rather than run jobs without Docker.
+- **At each start**, before the runner registers, the container starts `dockerd` (as root, through `sudo -n` when the image's user isn't root; its log is `/tmp/dockerd.log` in the container), waits for it, opens `/var/run/docker.sock` to the runner's user, and removes the previous job's containers, running ones included, with their anonymous volumes.
+- **Images stay cached**: the daemon keeps its data in the volume `mac-runner-<runner id>-docker` at `/var/lib/docker`, which outlives the container, while a [JIT runner](#just-in-time-runners)'s work volume is still emptied for every job. Named volumes and networks that jobs create stay too. Removing the runner (or `mac-runner uninstall`, or turning `docker` off) deletes the volume; to empty it yourself, stop the runner and `docker volume rm` it.
+- `mac-runner list` and `status` show `Docker-in-Docker` for these runners, and the menu shows 🐳 DinD.
 
 ### Per-Runner Isolation Override
 
@@ -351,7 +453,7 @@ mac-runner add owner/trusted-project --isolation none
 In the GUI, each runner displays its isolation mode with an icon:
 - 🔓 No isolation
 - 👤 User isolation
-- 📦 Container isolation
+- 📦 Container isolation ("Container (Docker)" on the Docker engine)
 
 ## GUI Access
 

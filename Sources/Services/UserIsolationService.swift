@@ -155,6 +155,8 @@ class UserIsolationService {
 
     // MARK: - Process Management
 
+    /// - Parameter jitConfigFile: For a JIT runner, the 0600 file holding its JIT
+    ///   config (see `JITRunner.writeConfigFile`); the command reads and deletes it.
     func launchAsUser(
         username: String,
         executable: String,
@@ -162,14 +164,20 @@ class UserIsolationService {
         standardOutput: Any? = nil,
         standardError: Any? = nil,
         enableGUI: Bool = false,
-        openFileLimit: Int
+        openFileLimit: Int,
+        jitConfigFile: String? = nil
     ) throws -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
 
         // Use -n (non-interactive) and zsh -l to source .zprofile for PATH/TMPDIR
         let command = ResourceLimits.shellCommand(
-            Self.launchCommand(directory: currentDirectory, executable: executable, enableGUI: enableGUI),
+            Self.launchCommand(
+                directory: currentDirectory,
+                executable: executable,
+                enableGUI: enableGUI,
+                jitConfigFile: jitConfigFile
+            ),
             openFileLimit: openFileLimit
         )
 
@@ -187,15 +195,19 @@ class UserIsolationService {
     }
 
     /// Shell command that starts the runner in its directory, stripping GUI
-    /// access from its environment when `enableGUI` is false.
-    static func launchCommand(directory: String, executable: String, enableGUI: Bool) -> String {
+    /// access from its environment when `enableGUI` is false. With
+    /// `jitConfigFile`, it first takes the JIT config from that file and resets
+    /// the workspace (`JITRunner.launchPrelude`).
+    static func launchCommand(directory: String, executable: String, enableGUI: Bool, jitConfigFile: String? = nil) -> String {
         let escapedDir = directory.replacingOccurrences(of: "'", with: "'\\''")
         let escapedExec = executable.replacingOccurrences(of: "'", with: "'\\''")
         // `env` must wrap the executable itself, not `cd`, or the variables never reach the runner.
         let headlessEnv = enableGUI
             ? ""
             : "env -u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE -u XDG_RUNTIME_DIR CI=true HEADLESS=true "
-        return "cd '\(escapedDir)' && \(headlessEnv)'\(escapedExec)'"
+        let launch = "cd '\(escapedDir)' && \(headlessEnv)'\(escapedExec)'"
+        guard let jitConfigFile else { return launch }
+        return JITRunner.launchPrelude(runnerDirectory: directory, configFile: jitConfigFile) + " && " + launch
     }
 
     /// sudo arguments for running `command` in a login shell as the service user.

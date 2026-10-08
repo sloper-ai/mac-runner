@@ -430,6 +430,104 @@ final class GHCLIService: Sendable {
         }
     }
 
+    // MARK: - Just-in-time Runners
+
+    /// A single-use runner GitHub registered, and the config it starts from.
+    struct JITConfig: Sendable {
+        let runnerID: Int
+        let runnerName: String
+        /// The runner's credentials, base64-encoded: a secret, never logged.
+        let encodedJITConfig: String
+    }
+
+    /// Register a single-use (JIT) runner (`POST …/actions/runners/generate-jitconfig`).
+    /// `labels` are all it gets: GitHub adds no default labels to a JIT runner.
+    func generateJITConfig(
+        for target: RunnerTarget,
+        name: String,
+        labels: [String],
+        workFolder: String,
+        runnerGroupID: Int = 1
+    ) async throws -> JITConfig {
+        let result = try await runGH(Self.generateJITConfigArguments(
+            for: target, name: name, labels: labels, workFolder: workFolder, runnerGroupID: runnerGroupID
+        ))
+        guard result.exitCode == 0 else {
+            let detail = Self.registrationTokenFailureMessage(from: result.stderr)
+            throw GHError.apiFailed("Failed to register a JIT runner: \(detail)")
+        }
+        guard let config = Self.decodeJITConfig(result.stdout) else {
+            // Never quote the response: it holds the runner's credentials.
+            throw GHError.apiFailed("Failed to register a JIT runner: GitHub's response had no runner or JIT config")
+        }
+        return config
+    }
+
+    static func generateJITConfigArguments(
+        for target: RunnerTarget,
+        name: String,
+        labels: [String],
+        workFolder: String,
+        runnerGroupID: Int = 1
+    ) -> [String] {
+        // -f sends strings as they are; -F makes runner_group_id a number;
+        // repeated `labels[]` fields make an array.
+        [
+            "api", "-X", "POST", "\(target.apiPath)/actions/runners/generate-jitconfig",
+            "-f", "name=\(name)",
+            "-F", "runner_group_id=\(runnerGroupID)",
+            "-f", "work_folder=\(workFolder)",
+        ] + labels.flatMap { ["-f", "labels[]=\($0)"] }
+    }
+
+    static func decodeJITConfig(_ output: String) -> JITConfig? {
+        struct Response: Decodable {
+            struct Registered: Decodable {
+                let id: Int
+                let name: String
+            }
+            let runner: Registered
+            let encodedJITConfig: String
+
+            enum CodingKeys: String, CodingKey {
+                case runner
+                case encodedJITConfig = "encoded_jit_config"
+            }
+        }
+        guard let response = try? JSONDecoder().decode(Response.self, from: Data(output.utf8)),
+              !response.encodedJITConfig.isEmpty else {
+            return nil
+        }
+        return JITConfig(
+            runnerID: response.runner.id,
+            runnerName: response.runner.name,
+            encodedJITConfig: response.encodedJITConfig
+        )
+    }
+
+    enum RunnerDeletion: Equatable, Sendable {
+        case deleted
+        /// GitHub had no such runner (404): deleted already, e.g. a JIT runner after its job.
+        case alreadyGone
+    }
+
+    /// Delete a runner registration; one that's already gone (404) counts as deleted.
+    @discardableResult
+    func deleteRunnerIfPresent(target: RunnerTarget, githubRunnerId: Int) async throws -> RunnerDeletion {
+        let result = try await runGH([
+            "api", "-X", "DELETE",
+            "\(target.apiPath)/actions/runners/\(githubRunnerId)"
+        ])
+        if result.exitCode == 0 { return .deleted }
+        if Self.isNotFound(result.stderr) { return .alreadyGone }
+        throw GHError.apiFailed("Failed to delete runner \(githubRunnerId): \(result.stderr)")
+    }
+
+    /// Whether `gh api` failed with a 404 ("gh: Not Found (HTTP 404)").
+    static func isNotFound(_ stderr: String) -> Bool {
+        stderr.contains("(HTTP 404)")
+    }
+
     private func listWorkflowRuns(for repo: String, status: String) async throws -> [WorkflowRunSummary] {
         let result = try await runGH([
             "api", "repos/\(repo)/actions/runs?status=\(status)&per_page=10",

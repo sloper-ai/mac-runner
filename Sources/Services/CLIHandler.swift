@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum CLIHandler {
@@ -159,6 +160,13 @@ enum CLIHandler {
           --isolation <mode>   Isolation mode: none|user|container (default: global)
           --enable-gui         Enable GUI access (default: headless)
           --image <ref>        Container image for --isolation container (default: ghcr.io/actions/actions-runner:latest)
+          --engine <engine>    Container engine for --isolation container: apple|docker (default: apple)
+          --cpus <n>           CPUs for --isolation container (default: 2)
+          --memory <size>      Memory for --isolation container: 8g, 8192m, or MB (default: 4g)
+          --jit                Single-use runners: register a new one, with a fresh workspace, for each job
+          --no-tools           Container isolation: install no tools when the container starts
+          --cache <path>       Docker engine: keep this container path in a volume across jobs (repeatable)
+          --docker             Docker engine: give jobs Docker of their own (Docker-in-Docker; privileged container)
 
         SETUP OPTIONS:
           --teardown        Remove isolation (delete user, sudoers, reset config)
@@ -203,6 +211,11 @@ enum CLIHandler {
           mac-runner add my-org --org --labels macos,arm64
           mac-runner add owner/repo --isolation container
           mac-runner add owner/repo --isolation container --image ghcr.io/myorg/runner:latest
+          mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --cpus 4 --memory 8g
+          mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --jit --no-tools \\
+            --labels self-hosted,linux,arm64 --cache /home/runner/.cargo/registry
+          mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --docker
+          mac-runner add owner/repo --isolation user --jit --labels self-hosted,macos,arm64
           mac-runner add owner/repo --isolation user
           mac-runner add owner/repo --enable-gui
           mac-runner list
@@ -241,9 +254,7 @@ enum CLIHandler {
 
         // Pre-compute isolation text for column sizing
         let isolationTexts = runners.map { runner -> String in
-            let effective = runner.effectiveIsolationMode(global: globalMode)
-            let isInherited = runner.isolationMode == nil
-            return "\(effective.icon) \(effective.displayName)\(isInherited ? " (global)" : "")"
+            isolationText(for: runner, global: globalMode)
         }
 
         // Display the scope alongside the identifier so org-level runners are
@@ -269,84 +280,50 @@ enum CLIHandler {
         }
     }
 
+    /// A runner's isolation for `list`, e.g. "📦 Container (Docker) · 4 CPUs, 8 GB · JIT · Docker-in-Docker":
+    /// container runners show their engine when it's Docker, and their CPUs and
+    /// memory when those aren't the defaults; single-use runners say JIT, and
+    /// runners whose jobs get their own Docker say Docker-in-Docker.
+    static func isolationText(for runner: Runner, global globalMode: IsolationMode) -> String {
+        let effective = runner.effectiveIsolationMode(global: globalMode)
+        var text = "\(effective.icon) \(runner.isolationDisplayName(for: effective))"
+        if runner.isolationMode == nil {
+            text += " (global)"
+        }
+        if effective == .container, let resources = runner.containerResourcesSummary {
+            text += " · \(resources)"
+        }
+        if runner.isJIT {
+            text += " · JIT"
+        }
+        if runner.usesDockerInDocker(global: globalMode) {
+            text += " · Docker-in-Docker"
+        }
+        return text
+    }
+
     @MainActor
     private static func handleAdd(args: [String]) async {
-        guard let target = args.first else {
+        guard !args.isEmpty else {
             print("Error: repository or organization required")
-            print("Usage: mac-runner add <owner/repo> [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>]")
-            print("       mac-runner add <org> --org [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>]")
+            print("Usage: mac-runner add <owner/repo> [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>] [--jit]")
+            print("       mac-runner add <org> --org [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>] [--jit]")
             return
         }
 
-        var name = "mac-runner-\(ProcessInfo.processInfo.hostName.prefix(8))-\(Int.random(in: 1000...9999))"
-        var labels: [String]?
-        var isolationMode: IsolationMode? = nil
-        var enableGUI = false
-        var openFileLimit: Int? = nil
-        var scope: RunnerScope = .repo
-        var image: String?
-
-        // Parse optional flags
-        var i = 1
-        while i < args.count {
-            switch args[i] {
-            case "--org":
-                scope = .org
-                i += 1
-            case "--repo":
-                scope = .repo
-                i += 1
-            case "--name" where i + 1 < args.count:
-                name = args[i + 1]
-                i += 2
-            case "--labels" where i + 1 < args.count:
-                labels = args[i + 1].split(separator: ",").map(String.init)
-                i += 2
-            case "--isolation" where i + 1 < args.count:
-                let mode = args[i + 1].lowercased()
-                switch mode {
-                case "none":
-                    isolationMode = IsolationMode.none  // not `.none`, which would be Optional.none (use global)
-                case "user":
-                    isolationMode = .dedicatedUser(username: IsolationMode.defaultUsername)
-                case "container":
-                    isolationMode = .container
-                default:
-                    print("Error: invalid isolation mode '\(mode)'. Valid options: none, user, container")
-                    return
-                }
-                i += 2
-            case "--enable-gui":
-                enableGUI = true
-                i += 1
-            case "--image" where i + 1 < args.count:
-                image = args[i + 1]
-                i += 2
-            case "--open-files" where i + 1 < args.count:
-                guard let parsed = Int(args[i + 1]), parsed > 0 else {
-                    print("Error: --open-files must be a positive integer")
-                    return
-                }
-                openFileLimit = parsed
-                i += 2
-            default:
-                i += 1
-            }
+        let command: AddCommand
+        switch AddCommand.parse(args) {
+        case .success(let parsed): command = parsed
+        case .failure(let error):
+            print("Error: \(error.text)")
+            return
         }
-
-        // Validate the identifier shape against the chosen scope.
-        switch scope {
-        case .repo:
-            guard target.contains("/") else {
-                print("Error: repository required in owner/repo format (or pass --org to register an organization runner)")
-                return
-            }
-        case .org:
-            guard !target.contains("/") else {
-                print("Error: --org expects an organization login only (no slashes)")
-                return
-            }
-        }
+        let target = command.target
+        let scope = command.scope
+        let isolationMode = command.isolationMode
+        let enableGUI = command.enableGUI
+        let openFileLimit = command.openFileLimit
+        let name = command.name ?? "mac-runner-\(ProcessInfo.processInfo.hostName.prefix(8))-\(Int.random(in: 1000...9999))"
 
         // Check auth first
         let authState = await GHCLIService.shared.validateAuth()
@@ -357,8 +334,8 @@ enum CLIHandler {
 
         let manager = RunnerManager()
         let effectiveIsolation = isolationMode ?? manager.currentSettings.isolationMode
-        if image != nil && effectiveIsolation != .container {
-            print("Error: --image only applies to container isolation (--isolation container)")
+        if let error = command.validationError(globalIsolation: manager.currentSettings.isolationMode) {
+            print("Error: \(error.text)")
             return
         }
 
@@ -369,17 +346,34 @@ enum CLIHandler {
                 name: name,
                 repo: target,
                 scope: scope,
-                labels: labels ?? Runner.defaultLabels(for: effectiveIsolation),
+                labels: command.labels ?? Runner.defaultLabels(for: effectiveIsolation),
                 isolationMode: isolationMode,
                 enableGUI: enableGUI,
                 openFileLimit: openFileLimit,
-                containerImage: image
+                containerImage: command.image,
+                containerEngine: command.engine,
+                containerCPUs: command.cpus,
+                containerMemoryMB: command.memoryMB,
+                jit: command.jit,
+                containerToolsOverride: command.containerToolsOverride,
+                containerCachePaths: command.cachePaths.isEmpty ? nil : command.cachePaths,
+                dockerInDocker: command.docker
             )
+            let added = manager.runner(named: name)
             var message = "Runner '\(name)' added"
             if let mode = isolationMode {
-                message += " with \(mode.displayName) isolation"
+                message += " with \(added?.isolationDisplayName(for: mode) ?? mode.displayName) isolation"
             } else {
                 message += " (using global isolation mode)"
+            }
+            if let resources = added?.containerResourcesSummary {
+                message += " (\(resources))"
+            }
+            if command.jit {
+                message += " as a single-use (JIT) runner"
+            }
+            if command.docker {
+                message += " with Docker-in-Docker"
             }
             message += enableGUI ? " with GUI access" : " (headless)"
             if let openFileLimit {
@@ -387,6 +381,11 @@ enum CLIHandler {
             }
             message += " and started successfully!"
             print(message)
+            if let added, added.isJIT {
+                for note in jitNotes(for: added, appIsRunning: menuBarAppIsRunning()) {
+                    print(note)
+                }
+            }
             await hostContainerRunnersInForeground(manager: manager)
         } catch {
             print("Error: \(error.localizedDescription)")
@@ -487,6 +486,11 @@ enum CLIHandler {
         do {
             try await manager.startRunner(runner.id)
             print("Runner '\(name)' started.")
+            if let started = manager.runner(named: name), started.isJIT {
+                for note in jitNotes(for: started, appIsRunning: menuBarAppIsRunning()) {
+                    print(note)
+                }
+            }
             await hostContainerRunnersInForeground(manager: manager)
         } catch {
             print("Error: \(error.localizedDescription)")
@@ -554,6 +558,77 @@ enum CLIHandler {
         case .container:
             print("  Global isolation: container")
         }
+
+        let globalMode = manager.currentSettings.isolationMode
+        let containerLines = containerStatusLines(runners: runners, global: globalMode)
+        if !containerLines.isEmpty {
+            print("  Container runners:")
+            for line in containerLines {
+                print("    \(line)")
+            }
+        }
+        let jitLines = jitStatusLines(runners: runners)
+        if !jitLines.isEmpty {
+            print("  JIT runners (single-use, one registration per job):")
+            for line in jitLines {
+                print("    \(line)")
+            }
+        }
+        if runners.contains(where: { $0.runsInDocker(global: globalMode) }) {
+            let docker = DockerRunnerEngine.executablePath()
+            let state: String
+            if let docker {
+                state = await DockerRunnerEngine.daemonInfo(docker: docker) != nil ? "running" : "not running"
+            } else {
+                state = "not installed"
+            }
+            print("  Docker: \(state)")
+        }
+    }
+
+    /// `status` lines for container runners on Docker or without the default
+    /// CPUs and memory, e.g. "linux-1: Container (Docker) · 4 CPUs, 8 GB · Docker-in-Docker".
+    static func containerStatusLines(runners: [Runner], global globalMode: IsolationMode) -> [String] {
+        runners.sorted { $0.name < $1.name }.compactMap { runner in
+            let isolation = runner.effectiveIsolationMode(global: globalMode)
+            guard isolation == .container else { return nil }
+            let resources = runner.containerResourcesSummary
+            guard runner.effectiveContainerEngine == .docker || resources != nil else { return nil }
+            return "\(runner.name): \(runner.isolationDisplayName(for: isolation))" + (resources.map { " · \($0)" } ?? "")
+                + (runner.usesDockerInDocker(global: globalMode) ? " · Docker-in-Docker" : "")
+        }
+    }
+
+    /// `status` lines for JIT runners, e.g. "linux-1: JIT, registered as linux-1-3fa29c (GitHub ID 42)".
+    static func jitStatusLines(runners: [Runner]) -> [String] {
+        runners.filter(\.isJIT).sorted { $0.name < $1.name }.map { runner in
+            let state: String
+            if let registration = runner.jitRegistration {
+                state = "registered as \(registration.name) (GitHub ID \(registration.id))"
+            } else {
+                state = runner.status == .running ? "between jobs, registering the next" : "not registered (\(runner.status.rawValue))"
+            }
+            return "\(runner.name): JIT, \(state)"
+        }
+    }
+
+    /// What to tell someone who just started a JIT runner from the CLI.
+    static func jitNotes(for runner: Runner, appIsRunning: Bool) -> [String] {
+        var notes: [String] = []
+        let wanted = ["self-hosted"]
+        if !runner.labels.contains(where: { wanted.contains($0.lowercased()) }) {
+            notes.append("Note: a JIT runner gets only the labels it's registered with (\(runner.labels.joined(separator: ","))); add self-hosted, the OS, and the architecture to --labels if your workflows ask for them.")
+        }
+        if !appIsRunning {
+            notes.append("Note: this JIT runner exits after its job, and the Mac Runner menu bar app registers and starts the next one. It isn't running: open it (open -a MacRunner) to keep this runner taking jobs.")
+        }
+        return notes
+    }
+
+    /// Whether the Mac Runner menu bar app is running (it supervises JIT runners).
+    static func menuBarAppIsRunning() -> Bool {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.omniaura.mac-runner")
+            .contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && !$0.isTerminated }
     }
 
     /// `mac-runner status --resources` output.
@@ -694,6 +769,9 @@ enum CLIHandler {
         }
         print(failures == 0 ? "Applied \(changes.count) change(s)." : "\(failures) of \(changes.count) change(s) failed.")
         if failures > 0 { exitCode = 1 }
+        if manager.runners.contains(where: { $0.isJIT && $0.status == .running }), !menuBarAppIsRunning() {
+            print("Note: JIT runners exit after each job, and the Mac Runner menu bar app registers and starts the next one. It isn't running: open it (open -a MacRunner) to keep them taking jobs.")
+        }
         await hostContainerRunnersInForeground(manager: manager)
     }
 
@@ -883,13 +961,21 @@ enum CLIHandler {
             globalIsolationMode: config.settings.isolationMode,
             includeApplication: includeApplication
         )
+        // A Docker runner's work directory and caches are volumes, not files.
+        let dockerVolumes = config.runners
+            .filter { $0.runsInDocker(global: config.settings.isolationMode) }
+            .flatMap { runner in
+                [DockerRunnerEngine.workVolumeName(for: runner.id)]
+                    + DockerRunnerEngine.cacheMounts(for: runner.id, paths: runner.containerCachePaths ?? []).map(\.volume)
+                    + (runner.dockerInDocker == true ? [DockerRunnerEngine.dockerVolumeName(for: runner.id)] : [])
+            }
 
-        guard !plan.isEmpty else {
+        guard !plan.isEmpty || !dockerVolumes.isEmpty else {
             print("Nothing to uninstall - no Mac Runner files found.")
             return
         }
 
-        printPlan(plan, keepRunners: keepRunners)
+        printPlan(plan, keepRunners: keepRunners, dockerVolumes: dockerVolumes)
 
         if dryRun {
             let size = ByteCountFormatter.string(fromByteCount: plan.totalBytes, countStyle: .file)
@@ -930,12 +1016,26 @@ enum CLIHandler {
             for runner in plan.runnersToDeregister {
                 guard let ghId = runner.githubRunnerId else { continue }
                 do {
-                    try await GHCLIService.shared.deleteRunner(target: runner.target, githubRunnerId: ghId)
+                    // Already gone counts: stopping a JIT runner above deleted its registration.
+                    try await GHCLIService.shared.deleteRunnerIfPresent(target: runner.target, githubRunnerId: ghId)
                     deregistered.append(runner.name)
                 } catch {
                     failedDeregistrations.append("\(runner.name) (\(runner.repo))")
                 }
             }
+            // Offline registrations left by JIT runners' earlier starts.
+            for runner in config.runners where runner.isJIT {
+                guard let remote = try? await GHCLIService.shared.listRemoteRunners(for: runner.target) else { continue }
+                for leftover in JITRunner.leftoverRegistrations(of: runner.name, in: remote) {
+                    _ = try? await GHCLIService.shared.deleteRunnerIfPresent(target: runner.target, githubRunnerId: leftover.id)
+                }
+            }
+        }
+
+        // Containers, work and cache volumes, for any container runner that ever used Docker.
+        var removedVolumes = 0
+        for runner in config.runners where runner.effectiveIsolationMode(global: config.settings.isolationMode) == .container {
+            removedVolumes += await DockerRunnerEngine.removeContainerAndVolumes(for: runner.id)
         }
 
         let report = service.execute(
@@ -946,9 +1046,12 @@ enum CLIHandler {
         )
 
         printReport(report, service: service, includedApplication: includeApplication, keepRunners: keepRunners)
+        if removedVolumes > 0 {
+            print("Removed \(removedVolumes) Docker volume(s).")
+        }
     }
 
-    private static func printPlan(_ plan: UninstallPlan, keepRunners: Bool) {
+    private static func printPlan(_ plan: UninstallPlan, keepRunners: Bool, dockerVolumes: [String] = []) {
         print("Mac Runner uninstall")
         print("")
 
@@ -977,6 +1080,14 @@ enum CLIHandler {
         let total = ByteCountFormatter.string(fromByteCount: plan.totalBytes, countStyle: .file)
         print("")
         print("Total: \(plan.items.count) item(s), \(total)")
+
+        if !dockerVolumes.isEmpty {
+            print("")
+            print("Will remove Docker volumes (runner work directories, caches, and Docker-in-Docker images):")
+            for volume in dockerVolumes {
+                print("  \(volume)")
+            }
+        }
     }
 
     private static func printReport(

@@ -363,7 +363,7 @@ struct RunnerRow: View {
                 FlowLayout(spacing: 4) {
                     // Isolation mode indicator
                     if let mode = runner.isolationMode {
-                        Text("\(mode.icon) \(mode.displayName)")
+                        Text("\(mode.icon) \(runner.isolationDisplayName(for: mode))")
                             .font(.caption2)
                             .lineLimit(1)
                             .fixedSize()
@@ -401,6 +401,30 @@ struct RunnerRow: View {
                             .padding(.vertical, 2)
                             .background(Color.gray.opacity(0.2))
                             .cornerRadius(4)
+                    }
+
+                    if runner.isJIT {
+                        Text("♻️ JIT")
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.teal.opacity(0.2))
+                            .cornerRadius(4)
+                            .help("Single-use: a new registration and a fresh workspace for each job")
+                    }
+
+                    if runner.dockerInDocker == true && runner.effectiveContainerEngine == .docker {
+                        Text("🐳 DinD")
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.2))
+                            .cornerRadius(4)
+                            .help("Docker-in-Docker: jobs get a Docker daemon of their own (privileged container)")
                     }
 
                     if let quietHours = runner.quietHours {

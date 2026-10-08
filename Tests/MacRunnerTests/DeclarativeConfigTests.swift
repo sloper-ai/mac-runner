@@ -185,4 +185,130 @@ final class DeclarativeConfigTests: XCTestCase {
         guard case .update(_, _, _, let restart) = plan.first else { return XCTFail("\(plan)") }
         XCTAssertFalse(restart)
     }
+
+    // MARK: - Container engine and resources
+
+    func testEngineCPUsAndMemoryKeys() throws {
+        let yaml = """
+        runners:
+          - name: linux
+            repo: o/r
+            isolation: container
+            engine: docker
+            cpus: 4
+            memory: 8g
+          - name: plain
+            repo: o/r
+            isolation: container
+            memory: 6144
+          - name: pinned
+            repo: o/r
+            isolation: container
+            engine: Apple
+            memory: 2048m
+        """
+        let runners = try DeclarativeConfig.parse(yaml).desiredRunners(hostCores: 8)
+        XCTAssertEqual(runners[0].containerEngine, .docker)
+        XCTAssertEqual(runners[0].containerCPUs, 4)
+        XCTAssertEqual(runners[0].containerMemoryMB, 8192)
+        XCTAssertNil(runners[1].containerEngine, "no key means Apple's engine")
+        XCTAssertNil(runners[1].containerCPUs)
+        XCTAssertEqual(runners[1].containerMemoryMB, 6144, "a plain number is megabytes")
+        XCTAssertEqual(runners[2].containerEngine, .apple)
+        XCTAssertEqual(runners[2].containerMemoryMB, 2048)
+
+        let inherited = try DeclarativeConfig.parse("runners:\n  - name: c\n    repo: o/r\n    engine: docker\n    cpus: 2\n")
+            .desiredRunners(globalIsolation: .container, hostCores: 8)
+        XCTAssertEqual(inherited.first?.containerEngine, .docker, "the global container mode counts")
+    }
+
+    func testRejectsInvalidEngineCPUsAndMemory() {
+        let container = "runners:\n  - name: r\n    repo: o/r\n    isolation: container\n"
+        let invalid: [(String, String)] = [
+            ("runners:\n  - name: r\n    repo: o/r\n    engine: docker\n", "r: engine requires container isolation"),
+            ("runners:\n  - name: r\n    repo: o/r\n    cpus: 2\n", "r: cpus requires container isolation"),
+            ("runners:\n  - name: r\n    repo: o/r\n    memory: 4g\n", "r: memory requires container isolation"),
+            ("runners:\n  - name: r\n    repo: o/r\n    isolation: none\n    engine: docker\n", "engine requires container isolation"),
+            (container + "    engine: podman\n", "r: engine 'podman' must be apple or docker"),
+            (container + "    cpus: 9\n", "r: cpus must be between 1 and 8"),
+            (container + "    cpus: 0\n", "r: cpus must be between 1 and 8"),
+            (container + "    memory: 512m\n", "r: memory must be at least 1g"),
+            (container + "    memory: plenty\n", "r: memory 'plenty' must be a size"),
+            (container + "    engin: docker\n", "unknown key 'engin' in runner 'r'"),
+        ]
+        for (yaml, expected) in invalid {
+            do {
+                _ = try DeclarativeConfig.parse(yaml).desiredRunners(hostCores: 8)
+                XCTFail("expected failure for:\n\(yaml)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains(expected), "\(error.localizedDescription) should mention \(expected)")
+            }
+        }
+    }
+
+    func testExportWritesEngineAndResourcesOnlyWhenSet() throws {
+        let docker = Runner(name: "d", repo: "o/r", isolationMode: .container, containerEngine: .docker,
+                            containerCPUs: 4, containerMemoryMB: 8192)
+        let apple = Runner(name: "a", repo: "o/r", isolationMode: .container, containerEngine: .apple, containerMemoryMB: 1536)
+        let plain = Runner(name: "p", repo: "o/r", isolationMode: .container)
+
+        let config = DeclarativeConfig.export(runners: [docker, apple, plain], settings: AppSettings())
+        XCTAssertEqual(config.runners.map(\.engine), [nil, "docker", nil], "Apple's engine isn't written")
+        XCTAssertEqual(config.runners.map(\.cpus), [nil, 4, nil])
+        XCTAssertEqual(config.runners.map(\.memory), [DeclarativeConfig.MemorySpec("1536m"), DeclarativeConfig.MemorySpec("8g"), nil])
+
+        let yaml = try config.yaml()
+        XCTAssertTrue(yaml.contains("engine: docker"), yaml)
+        XCTAssertTrue(yaml.contains("cpus: 4"), yaml)
+        XCTAssertTrue(yaml.contains("memory: 8g"), yaml)
+
+        let parsed = try DeclarativeConfig.parse(yaml)
+        let plan = ConfigPlanner.plan(
+            desired: try parsed.desiredRunners(hostCores: 8),
+            desiredSettings: try parsed.resolvedSettings(AppSettings()),
+            current: [docker, apple, plain],
+            currentSettings: AppSettings()
+        )
+        XCTAssertEqual(plan, [], "exporting then applying changes nothing:\n\(yaml)")
+    }
+
+    func testEngineAndResourceChangesUpdateInPlace() {
+        let running = Runner(name: "r", repo: "o/r", status: .running, isolationMode: .container)
+        func want(_ runner: Runner) -> DesiredRunner {
+            DesiredRunner(name: runner.name, target: runner.target, labels: runner.labels, isolation: runner.isolationMode,
+                          enableGUI: runner.enableGUI, openFileLimit: runner.openFileLimit, quietHours: runner.quietHours,
+                          containerImage: runner.containerImage, containerEngine: runner.containerEngine,
+                          containerCPUs: runner.containerCPUs, containerMemoryMB: runner.containerMemoryMB)
+        }
+        func update(_ desired: DesiredRunner, from runner: Runner) -> (changes: [String], restart: Bool)? {
+            let plan = ConfigPlanner.plan(desired: [desired], desiredSettings: AppSettings(), current: [runner], currentSettings: AppSettings())
+            guard plan.count == 1, case .update(_, _, let changes, let restart) = plan[0] else { return nil }
+            return (changes, restart)
+        }
+
+        var docker = want(running)
+        docker.containerEngine = .docker
+        XCTAssertEqual(update(docker, from: running)?.changes, ["engine apple → docker"])
+        XCTAssertEqual(update(docker, from: running)?.restart, true, "a running runner restarts on its new engine")
+
+        var stopped = running
+        stopped.status = .stopped
+        XCTAssertEqual(update(docker, from: stopped)?.restart, false)
+
+        var sized = want(running)
+        sized.containerCPUs = 4
+        sized.containerMemoryMB = 8192
+        XCTAssertEqual(update(sized, from: running)?.changes, ["cpus default → 4", "memory default → 8g"])
+        XCTAssertEqual(update(sized, from: running)?.restart, true)
+
+        var pinned = want(running)
+        pinned.containerCPUs = 2
+        pinned.containerMemoryMB = 4096
+        XCTAssertEqual(update(pinned, from: running)?.changes, ["cpus default → 2", "memory default → 4g"])
+        XCTAssertEqual(update(pinned, from: running)?.restart, false, "pinning the defaults changes nothing that's running")
+
+        var explicitApple = want(running)
+        explicitApple.containerEngine = .apple
+        XCTAssertEqual(ConfigPlanner.plan(desired: [explicitApple], desiredSettings: AppSettings(), current: [running], currentSettings: AppSettings()), [])
+    }
 }
