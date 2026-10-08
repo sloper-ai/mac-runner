@@ -2,9 +2,12 @@ name: Release
 
 # semantic-release reads the Conventional Commits on main and decides whether a
 # release is due (see RELEASING.md). Only then does it build the app, through
-# scripts/build-release.sh, commit CHANGELOG.md and Casks/mac-runner.rb, tag the
-# release and publish it on GitHub with the zipped app attached. This repository
-# is also the Homebrew tap, so that commit is what `brew upgrade` picks up.
+# scripts/build-release.sh, update CHANGELOG.md and Casks/mac-runner.rb in the
+# checkout, tag the main commit that triggered this run, and publish the release
+# with the zipped app attached. The organization's ruleset only accepts pull
+# requests on main, so the next step brings the cask and changelog there in a
+# release pull request that it merges. This repository is also the Homebrew tap:
+# that merge is what `brew upgrade` picks up.
 #
 # The organization allows only GitHub-owned actions, pinned to a full commit SHA.
 
@@ -17,11 +20,13 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-# Push the release commit and tag, and publish the release. semantic-release's
-# comments on issues and pull requests are off (.releaserc.json): this fork has
-# issues disabled. Turning them on needs issues and pull-requests: write.
+# contents: push the tag and the release branch, publish the release, merge the
+# release pull request. pull-requests: open that pull request. semantic-release's
+# own comments on issues and pull requests are off (.releaserc.json): this fork
+# has issues disabled.
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   release:
@@ -37,7 +42,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          # semantic-release pushes with the token passed to it below.
+          # Keep the token out of .git/config while third-party code builds; the
+          # steps that push authenticate with GITHUB_TOKEN themselves.
           persist-credentials: false
 
       - name: Set up Node.js
@@ -58,7 +64,6 @@ jobs:
           npm install --no-save --no-package-lock --ignore-scripts --no-audit --no-fund
           semantic-release@25.0.9
           @semantic-release/changelog@7.0.0
-          @semantic-release/git@11.0.1
           @semantic-release/exec@7.1.0
           conventional-changelog-conventionalcommits@10.4.0
 
@@ -133,9 +138,7 @@ jobs:
       # ── Release ───────────────────────────────────────────────────────
       - name: Release
         env:
-          # GITHUB_TOKEN cannot push the release commit while the organization's
-          # ruleset requires pull requests on main; RELEASE_TOKEN can (RELEASING.md).
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Read by scripts/notarize.sh when a Developer ID identity was imported.
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
@@ -143,6 +146,55 @@ jobs:
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npx semantic-release
+
+      # The release is tagged and published, and the checkout holds the updated cask
+      # and changelog. They reach main through a pull request that this step merges.
+      # Merges made with GITHUB_TOKEN don't trigger workflows, so this doesn't loop.
+      - name: Merge the cask and changelog through a release pull request
+        # semantic-release's successCmd writes build/released-version. Run even if a
+        # later semantic-release step failed: by then the release is out.
+        if: ${{ !cancelled() && hashFiles('build/released-version') != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          version="$(cat build/released-version)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::build/released-version holds '${version}', not a version"
+            exit 1
+          fi
+          branch="release/v${version}"
+          title="chore(release): ${version}"
+          release_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/v${version}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add Casks/mac-runner.rb CHANGELOG.md
+          # [skip ci]: a merge by hand then starts no (empty) release run.
+          git commit -m "${title} [skip ci]"
+
+          # Checkout didn't persist credentials; let git push with GH_TOKEN.
+          gh auth setup-git
+          git push origin "$branch"
+
+          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+            --title "$title" \
+            --body "Points the Homebrew cask at [v${version}](${release_url}), which is already published, and adds its notes to CHANGELOG.md.")"
+          echo "Opened ${pr_url}"
+
+          for attempt in 1 2 3; do
+            # GitHub may still be working out whether a new pull request can merge.
+            [ "$attempt" -eq 1 ] || sleep 10
+            if gh pr merge "${pr_url##*/}" --repo "$GITHUB_REPOSITORY" --squash --delete-branch; then
+              echo "Merged ${pr_url}"
+              exit 0
+            fi
+          done
+
+          echo "::error title=Release pull request not merged::v${version} is published, but GITHUB_TOKEN could not merge ${pr_url}; the ruleset on main may require an approval. Merge it by hand. Until then the Homebrew tap still offers the previous version."
+          exit 1
 
       - name: Clean up signing keychain
         if: always()

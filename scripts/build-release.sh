@@ -26,6 +26,10 @@ fi
 
 cd "$(dirname "$0")/.."
 
+# Nothing here needs GitHub credentials, and semantic-release passes its whole
+# environment on: keep its token away from the third-party code the build runs.
+unset GITHUB_TOKEN GH_TOKEN
+
 app="build/MacRunner.app"
 zip="build/MacRunner-${version}.zip"
 cask="Casks/mac-runner.rb"
