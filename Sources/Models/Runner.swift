@@ -64,6 +64,9 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     /// Docker engine: container paths backed by named volumes that outlive
     /// each container (package caches, say), so they survive across jobs.
     var containerCachePaths: [String]?
+    /// Docker engine: give jobs their own Docker daemon (Docker-in-Docker) in a
+    /// privileged container, its images kept in a volume across jobs. nil = off.
+    var dockerInDocker: Bool?
 
     init(
         id: UUID = UUID(),
@@ -86,7 +89,8 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         containerMemoryMB: Int? = nil,
         jit: Bool? = nil,
         containerToolsOverride: [String]? = nil,
-        containerCachePaths: [String]? = nil
+        containerCachePaths: [String]? = nil,
+        dockerInDocker: Bool? = nil
     ) {
         self.id = id
         self.name = name
@@ -109,6 +113,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         self.jit = jit == true ? true : nil
         self.containerToolsOverride = containerToolsOverride
         self.containerCachePaths = containerCachePaths.flatMap { $0.isEmpty ? nil : $0 }
+        self.dockerInDocker = dockerInDocker == true ? true : nil
     }
 
     init(from decoder: Decoder) throws {
@@ -147,6 +152,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         jitRegistration = try container.decodeIfPresent(JITRegistration.self, forKey: .jitRegistration)
         containerToolsOverride = try container.decodeIfPresent([String].self, forKey: .containerToolsOverride)
         containerCachePaths = try container.decodeIfPresent([String].self, forKey: .containerCachePaths)
+        dockerInDocker = try container.decodeIfPresent(Bool.self, forKey: .dockerInDocker) == true ? true : nil
     }
 
     /// User-editable settings, compared when reconciling concurrent config edits.
@@ -171,6 +177,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         var jitRegistration: JITRegistration?
         var containerToolsOverride: [String]?
         var containerCachePaths: [String]?
+        var dockerInDocker: Bool?
     }
 
     var configuration: Configuration {
@@ -183,7 +190,8 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
                 containerEngine: containerEngine,
                 containerCPUs: containerCPUs, containerMemoryMB: containerMemoryMB,
                 jit: jit, jitRegistration: jitRegistration,
-                containerToolsOverride: containerToolsOverride, containerCachePaths: containerCachePaths
+                containerToolsOverride: containerToolsOverride, containerCachePaths: containerCachePaths,
+                dockerInDocker: dockerInDocker
             )
         }
         set {
@@ -206,6 +214,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
             jitRegistration = newValue.jitRegistration
             containerToolsOverride = newValue.containerToolsOverride
             containerCachePaths = newValue.containerCachePaths
+            dockerInDocker = newValue.dockerInDocker
         }
     }
 
@@ -303,6 +312,11 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     /// Container isolation: the tools installed each time its container starts.
     var effectiveContainerTools: [String] {
         containerToolsOverride ?? containerTools ?? []
+    }
+
+    /// Whether its jobs get Docker of their own: on, for a runner on the Docker engine.
+    func usesDockerInDocker(global globalMode: IsolationMode) -> Bool {
+        dockerInDocker == true && runsInDocker(global: globalMode)
     }
 
     func effectiveOpenFileLimit(global globalLimit: Int) -> Int {

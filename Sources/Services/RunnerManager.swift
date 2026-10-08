@@ -524,6 +524,7 @@ class RunnerManager: ObservableObject {
     ///   - containerToolsOverride: Container isolation: tools to install at each start
     ///     instead of the detected ones ([] = none)
     ///   - containerCachePaths: Docker engine: container paths kept in cache volumes
+    ///   - dockerInDocker: Docker engine: give jobs their own Docker daemon
     /// - Throws: RunnerError if validation or setup fails
     func addRunner(
         name: String,
@@ -539,7 +540,8 @@ class RunnerManager: ObservableObject {
         containerMemoryMB: Int? = nil,
         jit: Bool = false,
         containerToolsOverride: [String]? = nil,
-        containerCachePaths: [String]? = nil
+        containerCachePaths: [String]? = nil,
+        dockerInDocker: Bool = false
     ) async throws {
         isLoading = true
         defer { isLoading = false }
@@ -569,6 +571,10 @@ class RunnerManager: ObservableObject {
         if let containerCachePaths, !containerCachePaths.isEmpty {
             guard runner.runsInDocker(global: currentSettings.isolationMode) else { throw RunnerError.cacheNeedsDocker }
             runner.containerCachePaths = try DockerRunnerEngine.cachePaths(containerCachePaths).get()
+        }
+        if dockerInDocker {
+            guard runner.runsInDocker(global: currentSettings.isolationMode) else { throw RunnerError.dockerInDockerNeedsDocker }
+            runner.dockerInDocker = true
         }
         if runner.isJIT && labels.isEmpty {
             // GitHub gives a JIT runner exactly the labels it's registered with.
@@ -827,7 +833,8 @@ class RunnerManager: ObservableObject {
                     openFileLimit: openFileLimit,
                     tools: runner.effectiveContainerTools,
                     enableGUI: runner.enableGUI,
-                    cacheDirectories: cachePaths
+                    cacheDirectories: cachePaths,
+                    dockerInDocker: runner.dockerInDocker == true
                 ) + DockerRunnerEngine.engineVariables
 
                 _ = try Self.makeDirectory(runnerDir, "_diag")
@@ -841,9 +848,10 @@ class RunnerManager: ObservableObject {
                     memoryMB: runner.effectiveContainerMemoryMB,
                     openFileLimit: openFileLimit,
                     environmentNames: variables.map(\.name),
-                    // A JIT runner's job gets an empty work volume; caches stay.
+                    // A JIT runner's job gets an empty work volume; caches and Docker's images stay.
                     resetWorkVolume: runner.isJIT,
-                    cacheMounts: DockerRunnerEngine.cacheMounts(for: id, paths: cachePaths)
+                    cacheMounts: DockerRunnerEngine.cacheMounts(for: id, paths: cachePaths),
+                    dockerInDocker: runner.dockerInDocker == true
                 )
                 let process = try processManager.startProcess(
                     for: id,
@@ -1401,11 +1409,12 @@ class RunnerManager: ObservableObject {
             return Target(id: runner.id, pid: pid, directory: directory)
         }
         let docker = dockerContainers.isEmpty ? nil : DockerRunnerEngine.executablePath()
-        // Its work volume and any cache volumes.
+        // Its work volume, any cache volumes, and its Docker-in-Docker images.
         let dockerVolumes = dockerContainers.keys.reduce(into: [UUID: [String]]()) { volumes, id in
-            let cachePaths = runners.first(where: { $0.id == id })?.containerCachePaths ?? []
+            let runner = runners.first(where: { $0.id == id })
             volumes[id] = [DockerRunnerEngine.workVolumeName(for: id)]
-                + DockerRunnerEngine.cacheMounts(for: id, paths: cachePaths).map(\.volume)
+                + DockerRunnerEngine.cacheMounts(for: id, paths: runner?.containerCachePaths ?? []).map(\.volume)
+                + (runner?.dockerInDocker == true ? [DockerRunnerEngine.dockerVolumeName(for: id)] : [])
         }
 
         let wantsDisk = measureDisk || lastDiskMeasurement.map { now.timeIntervalSince($0) >= 300 } ?? true
@@ -1713,6 +1722,7 @@ class RunnerManager: ObservableObject {
             _ = try await DockerRunnerEngine.requireRunningDaemon()
         }
         let previousCachePaths = runners[index].containerCachePaths ?? []
+        let dropsDockerVolume = runners[index].dockerInDocker == true && !desired.dockerInDocker
         runners[index].isolationMode = desired.isolation
         runners[index].enableGUI = desired.enableGUI
         runners[index].openFileLimit = desired.openFileLimit
@@ -1722,6 +1732,7 @@ class RunnerManager: ObservableObject {
         runners[index].containerMemoryMB = desired.containerMemoryMB
         runners[index].containerToolsOverride = desired.containerToolsOverride
         runners[index].containerCachePaths = desired.containerCachePaths.flatMap { $0.isEmpty ? nil : $0 }
+        runners[index].dockerInDocker = desired.dockerInDocker ? true : nil
         if !(switchesEngine && restart) {
             runners[index].containerEngine = desired.containerEngine
         }
@@ -1736,6 +1747,9 @@ class RunnerManager: ObservableObject {
             }
             if dropsCaches {
                 await DockerRunnerEngine.removeCacheVolumes(for: runner.id, keeping: desired.containerCachePaths ?? [])
+            }
+            if dropsDockerVolume {
+                await DockerRunnerEngine.removeDockerVolume(for: runner.id)
             }
             return nil
         }
@@ -1768,6 +1782,9 @@ class RunnerManager: ObservableObject {
         if dropsCaches {
             // Its old container is gone, so their volumes are free.
             await DockerRunnerEngine.removeCacheVolumes(for: runner.id, keeping: desired.containerCachePaths ?? [])
+        }
+        if dropsDockerVolume {
+            await DockerRunnerEngine.removeDockerVolume(for: runner.id)
         }
         try await startRunner(runner.id)
         return nil
@@ -1840,7 +1857,8 @@ class RunnerManager: ObservableObject {
             containerMemoryMB: desired.containerMemoryMB,
             jit: desired.jit,
             containerToolsOverride: desired.containerToolsOverride,
-            containerCachePaths: desired.containerCachePaths
+            containerCachePaths: desired.containerCachePaths,
+            dockerInDocker: desired.dockerInDocker
         )
         if let quietHours = desired.quietHours, let runner = runner(named: desired.name) {
             setQuietHours(quietHours, for: runner.id)
@@ -2407,7 +2425,8 @@ class RunnerManager: ObservableObject {
             containerMemoryMB: originalRunner.containerMemoryMB,
             jit: originalRunner.isJIT,
             containerToolsOverride: originalRunner.containerToolsOverride,
-            containerCachePaths: originalRunner.containerCachePaths
+            containerCachePaths: originalRunner.containerCachePaths,
+            dockerInDocker: originalRunner.dockerInDocker == true
         )
     }
 
@@ -3123,6 +3142,7 @@ enum RunnerError: LocalizedError {
     case startInProgress
     case jitNeedsLabels
     case cacheNeedsDocker
+    case dockerInDockerNeedsDocker
 
     var errorDescription: String? {
         switch self {
@@ -3149,6 +3169,8 @@ enum RunnerError: LocalizedError {
             return "A JIT runner needs at least one label: GitHub gives it only the labels it's registered with."
         case .cacheNeedsDocker:
             return "Cache volumes need container isolation on the Docker engine (--isolation container --engine docker)."
+        case .dockerInDockerNeedsDocker:
+            return "Docker for jobs (Docker-in-Docker) needs container isolation on the Docker engine (--isolation container --engine docker)."
         }
     }
 }

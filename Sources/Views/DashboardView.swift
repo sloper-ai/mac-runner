@@ -341,6 +341,9 @@ struct RunnerDetailView: View {
                     if let cachePaths = runner.containerCachePaths, !cachePaths.isEmpty {
                         DetailRow("Caches", cachePaths.joined(separator: ", "))
                     }
+                    if runner.dockerInDocker == true {
+                        DetailRow("Docker", "Docker-in-Docker, images in \(DockerRunnerEngine.dockerVolumeName(for: runner.id))")
+                    }
                 }
             }
             DetailRow("Display", runner.enableGUI ? "GUI access" : "Headless")

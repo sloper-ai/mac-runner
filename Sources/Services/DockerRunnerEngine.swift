@@ -35,6 +35,15 @@ enum DockerRunnerEngine {
         "mac-runner-\(id.uuidString)-work"
     }
 
+    /// Docker-in-Docker: the volume holding the runner's own Docker daemon's
+    /// data (images, layers), kept across containers.
+    static func dockerVolumeName(for id: UUID) -> String {
+        "mac-runner-\(id.uuidString)-docker"
+    }
+
+    /// Where the runner's own Docker daemon keeps its data in the container.
+    static let dockerDataMount = "/var/lib/docker"
+
     // MARK: - Cache Volumes
 
     /// Every cache volume of the runner starts with this.
@@ -103,6 +112,8 @@ enum DockerRunnerEngine {
     ///     with an empty one (JIT runners: a fresh workspace for every job). The
     ///     launch fails if it can't be deleted.
     ///   - cacheMounts: Volumes mounted at these container paths, kept across containers.
+    ///   - dockerInDocker: Run the container privileged, with the volume for its
+    ///     own Docker daemon's data at /var/lib/docker (kept across containers).
     static func launcherScript(
         docker: String,
         runnerID: UUID,
@@ -114,17 +125,21 @@ enum DockerRunnerEngine {
         openFileLimit: Int,
         environmentNames: [String],
         resetWorkVolume: Bool = false,
-        cacheMounts: [(volume: String, path: String)] = []
+        cacheMounts: [(volume: String, path: String)] = [],
+        dockerInDocker: Bool = false
     ) -> String {
         let container = containerName(for: runnerID)
         let workVolume = workVolumeName(for: runnerID)
         let lines: [[String]] = [
             [docker, "run", "--rm", "--init"],
+            // A Docker daemon in the container needs it (mounts, cgroups, iptables).
+            dockerInDocker ? ["--privileged"] : [],
             ["--name", container],
             ["--hostname", ContainerRunnerScript.hostname(for: runnerName)],
             ["--label", "\(runnerIDLabel)=\(runnerID.uuidString)"],
             ["-v", "\(workVolume):\(ContainerRunnerScript.workMount)"],
             cacheMounts.flatMap { ["-v", "\($0.volume):\($0.path)"] },
+            dockerInDocker ? ["-v", "\(dockerVolumeName(for: runnerID)):\(dockerDataMount)"] : [],
             ["-v", "\(runnerDirectory)/_diag:\(ContainerRunnerScript.diagnosticsMount)"],
             ["-v", "\(runnerDirectory)/\(scriptFileName):\(scriptMount):ro"],
             ["--cpus", "\(cpus)", "--memory", "\(memoryMB)m"],
@@ -174,7 +189,8 @@ enum DockerRunnerEngine {
         openFileLimit: Int,
         environmentNames: [String],
         resetWorkVolume: Bool = false,
-        cacheMounts: [(volume: String, path: String)] = []
+        cacheMounts: [(volume: String, path: String)] = [],
+        dockerInDocker: Bool = false
     ) throws -> String {
         let directory = URL(fileURLWithPath: runnerDirectory, isDirectory: true)
 
@@ -194,7 +210,8 @@ enum DockerRunnerEngine {
             openFileLimit: openFileLimit,
             environmentNames: environmentNames,
             resetWorkVolume: resetWorkVolume,
-            cacheMounts: cacheMounts
+            cacheMounts: cacheMounts,
+            dockerInDocker: dockerInDocker
         )
         try contents.write(to: launcher, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: launcher.path)
@@ -306,15 +323,23 @@ enum DockerRunnerEngine {
         return await run(docker, ["volume", "rm", workVolumeName(for: id)])?.succeeded ?? false
     }
 
-    /// Remove the runner's container, its work volume, and all its cache
-    /// volumes, including ones for paths it no longer lists (errors ignored).
-    /// Returns how many volumes were removed.
+    /// Remove the runner's container, its work volume, its Docker-in-Docker
+    /// volume, and all its cache volumes, including ones for paths it no
+    /// longer lists (errors ignored). Returns how many volumes were removed.
     @discardableResult
     static func removeContainerAndVolumes(for id: UUID) async -> Int {
         guard let docker = executablePath() else { return 0 }
         let removedWork = await removeContainerAndWorkVolume(for: id)
+        let removedDocker = await run(docker, ["volume", "rm", dockerVolumeName(for: id)])?.succeeded ?? false
         let removedCaches = await removeCacheVolumes(for: id, docker: docker)
-        return (removedWork ? 1 : 0) + removedCaches
+        return (removedWork ? 1 : 0) + (removedDocker ? 1 : 0) + removedCaches
+    }
+
+    /// Remove the runner's Docker-in-Docker volume, its images with it (errors
+    /// ignored; one a container still uses stays).
+    static func removeDockerVolume(for id: UUID) async {
+        guard let docker = executablePath() else { return }
+        _ = await run(docker, ["volume", "rm", dockerVolumeName(for: id)])
     }
 
     /// Remove the runner's cache volumes except those for `keeping` (errors

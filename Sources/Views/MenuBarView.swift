@@ -415,6 +415,18 @@ struct RunnerRow: View {
                             .help("Single-use: a new registration and a fresh workspace for each job")
                     }
 
+                    if runner.dockerInDocker == true && runner.effectiveContainerEngine == .docker {
+                        Text("🐳 DinD")
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.2))
+                            .cornerRadius(4)
+                            .help("Docker-in-Docker: jobs get a Docker daemon of their own (privileged container)")
+                    }
+
                     if let quietHours = runner.quietHours {
                         Text(quietHours.enabled ? "🌙 \(quietHours.displayRange)" : "🌙 Never pauses")
                             .font(.caption2)

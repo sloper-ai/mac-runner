@@ -23,6 +23,7 @@ import Yams
 ///     jit: true           # a single-use registration and fresh workspace per job
 ///     tools: []           # install nothing at start (default: detected tools)
 ///     cache: [/home/runner/.cargo/registry]   # Docker volumes kept across jobs
+///     docker: true        # Docker for jobs (Docker-in-Docker), Docker engine only
 ///     enable-gui: false
 ///     open-files: 65536
 ///     quiet-hours: never
@@ -63,9 +64,10 @@ struct DeclarativeConfig: Codable, Equatable {
         var jit: Bool?
         var tools: [String]?
         var cache: [String]?
+        var docker: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case name, repo, org, labels, isolation, image, engine, cpus, memory, count, jit, tools, cache
+            case name, repo, org, labels, isolation, image, engine, cpus, memory, count, jit, tools, cache, docker
             case enableGUI = "enable-gui"
             case openFiles = "open-files"
             case quietHours = "quiet-hours"
@@ -194,7 +196,7 @@ struct DeclarativeConfig: Codable, Equatable {
         for (index, runner) in ((root["runners"] as? [Any]) ?? []).enumerated() {
             guard let runner = runner as? [String: Any] else { continue }
             let name = (runner["name"] as? String).map { " '\($0)'" } ?? " #\(index + 1)"
-            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "engine", "cpus", "memory", "count", "jit", "tools", "cache"], context: " in runner\(name)")
+            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "engine", "cpus", "memory", "count", "jit", "tools", "cache", "docker"], context: " in runner\(name)")
         }
     }
 
@@ -257,7 +259,7 @@ struct DeclarativeConfig: Codable, Equatable {
             let memoryMB = try spec.memory.map { try Self.memoryMB($0.text, context: name) }
             let containerKeys = [
                 ("image", spec.image != nil), ("engine", engine != nil), ("cpus", spec.cpus != nil), ("memory", memoryMB != nil),
-                ("tools", spec.tools != nil), ("cache", spec.cache != nil),
+                ("tools", spec.tools != nil), ("cache", spec.cache != nil), ("docker", spec.docker == true),
             ]
             if effectiveIsolation != .container, let key = containerKeys.first(where: { $0.1 })?.0 {
                 throw DeclarativeConfigError.invalid("\(name): \(key) requires container isolation")
@@ -271,6 +273,9 @@ struct DeclarativeConfig: Codable, Equatable {
                 case .success(let normalized): return normalized
                 case .failure(let error): throw DeclarativeConfigError.invalid("\(name): \(error.text)")
                 }
+            }
+            if spec.docker == true && engine != .docker {
+                throw DeclarativeConfigError.invalid("\(name): docker requires the Docker engine (engine: docker)")
             }
             let labels = spec.labels ?? Runner.defaultLabels(for: effectiveIsolation)
             if spec.jit == true && labels.isEmpty {
@@ -297,7 +302,8 @@ struct DeclarativeConfig: Codable, Equatable {
                 containerMemoryMB: memoryMB,
                 jit: spec.jit ?? false,
                 containerToolsOverride: tools,
-                containerCachePaths: cachePaths.flatMap { $0.isEmpty ? nil : $0 }
+                containerCachePaths: cachePaths.flatMap { $0.isEmpty ? nil : $0 },
+                dockerInDocker: spec.docker ?? false
             )
             if count == 1 {
                 result.append(desired)
@@ -429,7 +435,8 @@ struct DeclarativeConfig: Codable, Equatable {
                     count: nil,
                     jit: runner.isJIT ? true : nil,
                     tools: runner.containerToolsOverride,
-                    cache: runner.containerCachePaths.flatMap { $0.isEmpty ? nil : $0 }
+                    cache: runner.containerCachePaths.flatMap { $0.isEmpty ? nil : $0 },
+                    docker: runner.dockerInDocker == true ? true : nil
                 )
             }
         )
@@ -476,6 +483,8 @@ struct DesiredRunner: Equatable {
     var containerToolsOverride: [String]? = nil
     /// Docker engine: container paths kept in cache volumes.
     var containerCachePaths: [String]? = nil
+    /// Docker engine: Docker for jobs (Docker-in-Docker).
+    var dockerInDocker: Bool = false
 }
 
 /// What `mac-runner apply` will do.
@@ -596,6 +605,10 @@ enum ConfigPlanner {
             }
             if (have.containerCachePaths ?? []) != (want.containerCachePaths ?? []) {
                 updates.append("cache \(describeCache(have.containerCachePaths)) → \(describeCache(want.containerCachePaths))")
+                restart = true
+            }
+            if (have.dockerInDocker == true) != want.dockerInDocker {
+                updates.append(want.dockerInDocker ? "docker on" : "docker off")
                 restart = true
             }
             if !QuietHours.equivalent(have.quietHours, want.quietHours) {

@@ -19,6 +19,8 @@ struct AddCommand: Equatable {
     var noTools = false
     /// Container paths kept in Docker cache volumes, normalized.
     var cachePaths: [String] = []
+    /// Give jobs their own Docker daemon (Docker-in-Docker).
+    var docker = false
 
     /// Parses the target and its options. Options it doesn't know are skipped.
     static func parse(
@@ -101,6 +103,9 @@ struct AddCommand: Equatable {
             case "--no-tools":
                 command.noTools = true
                 i += 1
+            case "--docker":
+                command.docker = true
+                i += 1
             case "--cache":
                 guard i + 1 < args.count else {
                     return .failure(.message("--cache requires a container path"))
@@ -139,13 +144,16 @@ struct AddCommand: Equatable {
         guard (isolationMode ?? globalIsolation) == .container else {
             let containerOptions = [
                 ("--image", image != nil), ("--engine", engine != nil), ("--cpus", cpus != nil), ("--memory", memoryMB != nil),
-                ("--no-tools", noTools), ("--cache", !cachePaths.isEmpty),
+                ("--no-tools", noTools), ("--cache", !cachePaths.isEmpty), ("--docker", docker),
             ]
             guard let option = containerOptions.first(where: { $0.1 })?.0 else { return nil }
             return .message("\(option) only applies to container isolation (--isolation container)")
         }
         if !cachePaths.isEmpty && engine != .docker {
             return .message("--cache needs the Docker engine (--engine docker)")
+        }
+        if docker && engine != .docker {
+            return .message("--docker needs the Docker engine (--engine docker)")
         }
         return nil
     }

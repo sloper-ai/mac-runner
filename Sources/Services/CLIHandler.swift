@@ -166,6 +166,7 @@ enum CLIHandler {
           --jit                Single-use runners: register a new one, with a fresh workspace, for each job
           --no-tools           Container isolation: install no tools when the container starts
           --cache <path>       Docker engine: keep this container path in a volume across jobs (repeatable)
+          --docker             Docker engine: give jobs Docker of their own (Docker-in-Docker; privileged container)
 
         SETUP OPTIONS:
           --teardown        Remove isolation (delete user, sudoers, reset config)
@@ -213,6 +214,7 @@ enum CLIHandler {
           mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --cpus 4 --memory 8g
           mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --jit --no-tools \\
             --labels self-hosted,linux,arm64 --cache /home/runner/.cargo/registry
+          mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --docker
           mac-runner add owner/repo --isolation user --jit --labels self-hosted,macos,arm64
           mac-runner add owner/repo --isolation user
           mac-runner add owner/repo --enable-gui
@@ -278,9 +280,10 @@ enum CLIHandler {
         }
     }
 
-    /// A runner's isolation for `list`, e.g. "📦 Container (Docker) · 4 CPUs, 8 GB · JIT":
+    /// A runner's isolation for `list`, e.g. "📦 Container (Docker) · 4 CPUs, 8 GB · JIT · Docker-in-Docker":
     /// container runners show their engine when it's Docker, and their CPUs and
-    /// memory when those aren't the defaults; single-use runners say JIT.
+    /// memory when those aren't the defaults; single-use runners say JIT, and
+    /// runners whose jobs get their own Docker say Docker-in-Docker.
     static func isolationText(for runner: Runner, global globalMode: IsolationMode) -> String {
         let effective = runner.effectiveIsolationMode(global: globalMode)
         var text = "\(effective.icon) \(runner.isolationDisplayName(for: effective))"
@@ -292,6 +295,9 @@ enum CLIHandler {
         }
         if runner.isJIT {
             text += " · JIT"
+        }
+        if runner.usesDockerInDocker(global: globalMode) {
+            text += " · Docker-in-Docker"
         }
         return text
     }
@@ -350,7 +356,8 @@ enum CLIHandler {
                 containerMemoryMB: command.memoryMB,
                 jit: command.jit,
                 containerToolsOverride: command.containerToolsOverride,
-                containerCachePaths: command.cachePaths.isEmpty ? nil : command.cachePaths
+                containerCachePaths: command.cachePaths.isEmpty ? nil : command.cachePaths,
+                dockerInDocker: command.docker
             )
             let added = manager.runner(named: name)
             var message = "Runner '\(name)' added"
@@ -364,6 +371,9 @@ enum CLIHandler {
             }
             if command.jit {
                 message += " as a single-use (JIT) runner"
+            }
+            if command.docker {
+                message += " with Docker-in-Docker"
             }
             message += enableGUI ? " with GUI access" : " (headless)"
             if let openFileLimit {
@@ -577,7 +587,7 @@ enum CLIHandler {
     }
 
     /// `status` lines for container runners on Docker or without the default
-    /// CPUs and memory, e.g. "linux-1: Container (Docker) · 4 CPUs, 8 GB".
+    /// CPUs and memory, e.g. "linux-1: Container (Docker) · 4 CPUs, 8 GB · Docker-in-Docker".
     static func containerStatusLines(runners: [Runner], global globalMode: IsolationMode) -> [String] {
         runners.sorted { $0.name < $1.name }.compactMap { runner in
             let isolation = runner.effectiveIsolationMode(global: globalMode)
@@ -585,6 +595,7 @@ enum CLIHandler {
             let resources = runner.containerResourcesSummary
             guard runner.effectiveContainerEngine == .docker || resources != nil else { return nil }
             return "\(runner.name): \(runner.isolationDisplayName(for: isolation))" + (resources.map { " · \($0)" } ?? "")
+                + (runner.usesDockerInDocker(global: globalMode) ? " · Docker-in-Docker" : "")
         }
     }
 
@@ -956,6 +967,7 @@ enum CLIHandler {
             .flatMap { runner in
                 [DockerRunnerEngine.workVolumeName(for: runner.id)]
                     + DockerRunnerEngine.cacheMounts(for: runner.id, paths: runner.containerCachePaths ?? []).map(\.volume)
+                    + (runner.dockerInDocker == true ? [DockerRunnerEngine.dockerVolumeName(for: runner.id)] : [])
             }
 
         guard !plan.isEmpty || !dockerVolumes.isEmpty else {
@@ -1071,7 +1083,7 @@ enum CLIHandler {
 
         if !dockerVolumes.isEmpty {
             print("")
-            print("Will remove Docker volumes (runner work directories and caches):")
+            print("Will remove Docker volumes (runner work directories, caches, and Docker-in-Docker images):")
             for volume in dockerVolumes {
                 print("  \(volume)")
             }

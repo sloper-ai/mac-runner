@@ -164,6 +164,56 @@ enum ContainerRunnerScript {
       done
     fi
 
+    # Docker-in-Docker: this runner's own Docker daemon, for its jobs. Without it,
+    # or if it won't come up, the runner isn't started: its jobs expect Docker.
+    if [ "${MR_DOCKER:-0}" = 1 ]; then
+      as_root() { if [ -n "$SUDO" ]; then $SUDO -n "$@"; else "$@"; fi; }
+      fail_docker() {
+        log "ERROR: $1 Not starting the runner so jobs don't run without Docker."
+        exit 1
+      }
+      command -v dockerd >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 \
+        || fail_docker "Docker-in-Docker needs dockerd and the docker CLI in the image (docker-ce, or docker.io on Debian and Ubuntu)."
+      docker_socket="${MR_DOCKER_SOCKET:-/var/run/docker.sock}"
+      docker_log="${MR_DOCKER_LOG:-/tmp/dockerd.log}"
+      # cgroup v2: move this container's processes into a child cgroup, so the
+      # daemon can hand controllers to its own containers (as Docker's dind does).
+      if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        as_root sh -c 'mkdir -p /sys/fs/cgroup/init && xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null; sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control' 2>/dev/null \
+          || log "Warning: couldn't delegate cgroup controllers; Docker's containers may not start"
+      fi
+      log "Starting Docker for this runner's jobs (log: $docker_log)"
+      as_root dockerd >"$docker_log" 2>&1 &
+      dockerd_pid=$!
+      docker_up=""
+      for _ in $(seq 1 "${MR_DOCKER_WAIT:-30}"); do
+        if as_root docker info >/dev/null 2>&1; then docker_up=1; break; fi
+        kill -0 "$dockerd_pid" 2>/dev/null || break
+        sleep 1
+      done
+      if [ -z "$docker_up" ]; then
+        tail -n 20 "$docker_log" 2>/dev/null | sed 's/^/[dockerd] /' || true
+        if kill -0 "$dockerd_pid" 2>/dev/null; then
+          fail_docker "the Docker daemon didn't answer within ${MR_DOCKER_WAIT:-30}s (its log is above)."
+        fi
+        fail_docker "the Docker daemon exited (its log is above). It needs a privileged container, and an image user that's root or has passwordless sudo."
+      fi
+      # Usable by this user and its jobs. Joining the socket's group now wouldn't
+      # reach processes already running, so open the socket (in this container only).
+      if [ ! -w "$docker_socket" ]; then
+        as_root chmod 666 "$docker_socket" || fail_docker "couldn't make $docker_socket usable by $(id -un)."
+      fi
+      # The previous job's containers go, running ones too (a restart policy brings
+      # them back), with their anonymous volumes. Images stay cached.
+      leftovers="$(docker ps -aq 2>/dev/null || true)"
+      if [ -n "$leftovers" ]; then
+        # shellcheck disable=SC2086
+        docker rm -f -v $leftovers >/dev/null || log "Warning: couldn't remove the previous job's containers"
+      fi
+      docker container prune -f >/dev/null 2>&1 || true
+      log "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '(unknown version)') is up for this runner's jobs"
+    fi
+
     cd "$RUNNER_HOME"
     if [ -n "${ACTIONS_RUNNER_INPUT_JITCONFIG:-}" ]; then
       # Single-use runner: it registers itself from the JIT config in its
@@ -231,7 +281,8 @@ enum ContainerRunnerScript {
 
     /// The script's inputs, in a fixed order: the container environment both
     /// engines give it. Values are passed as they are, never through a shell.
-    /// `cacheDirectories` (Docker cache volumes) are only listed when there are some.
+    /// `cacheDirectories` (Docker cache volumes) and `MR_DOCKER` (Docker-in-Docker)
+    /// are only listed when used, so other runners get the same inputs as before.
     static func variables(
         registrationURL: String,
         registration: Registration,
@@ -241,7 +292,8 @@ enum ContainerRunnerScript {
         openFileLimit: Int,
         tools: [String],
         enableGUI: Bool,
-        cacheDirectories: [String] = []
+        cacheDirectories: [String] = [],
+        dockerInDocker: Bool = false
     ) -> [(name: String, value: String)] {
         let apt = aptPackages(for: tools)
         var variables = [
@@ -262,6 +314,9 @@ enum ContainerRunnerScript {
         if !cacheDirectories.isEmpty {
             // Cache paths can't contain ':' (see DockerRunnerEngine.cachePaths).
             variables.append(("MR_CACHE_DIRS", cacheDirectories.joined(separator: ":")))
+        }
+        if dockerInDocker {
+            variables.append(("MR_DOCKER", "1"))
         }
         return variables
     }
