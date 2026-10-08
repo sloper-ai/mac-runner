@@ -415,7 +415,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) for automati
 
 ### Releases
 
-Every push to `main` runs semantic-release, which reads the Conventional Commits since the last release: `feat:` releases a minor version, `fix:` a patch. It then builds the app, publishes a [GitHub release](https://github.com/sloper-ai/mac-runner/releases) with the app attached, and moves the cask in this repository to the new version. See [RELEASING.md](RELEASING.md).
+Every push to `main` runs semantic-release, which reads the Conventional Commits since the last release: `feat:` releases a minor version, `fix:` a patch. It then builds the app, publishes a [GitHub release](https://github.com/sloper-ai/mac-runner/releases) with the app attached, and moves the cask in this repository to the new version through a pull request that it merges itself. See [RELEASING.md](RELEASING.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for full guidelines.
 
