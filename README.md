@@ -1,8 +1,9 @@
 # Mac Runner
 
 > **This is sloper-ai's fork of [omniaura/mac-runner](https://github.com/omniaura/mac-runner).**
-> It adds a Docker engine for container runners, with more features to come. Releases,
-> the Homebrew tap and in-app updates all come from this repository.
+> It adds a [Docker engine](#docker-engine) for container runners, with [Docker-in-Docker](#docker-for-jobs-docker-in-docker)
+> for their jobs, and [just-in-time runners](#just-in-time-runners): a single-use registration and a fresh
+> workspace for every job. Releases, the Homebrew tap and in-app updates all come from this repository.
 
 Simple Mac menu bar app and CLI for managing GitHub Actions self-hosted runners.
 
