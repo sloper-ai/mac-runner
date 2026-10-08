@@ -13,16 +13,20 @@ clean:
 	swift package clean
 	rm -rf .build build
 
+# Universal (arm64 + x86_64) release build
+RELEASE_FLAGS = -c release --arch arm64 --arch x86_64
+
 # Build release version
 release:
-	swift build -c release --arch arm64 --arch x86_64
+	swift build $(RELEASE_FLAGS)
 
 # Create app bundle
 app: release
 	@echo "Creating app bundle..."
 	@mkdir -p build/MacRunner.app/Contents/MacOS
 	@mkdir -p build/MacRunner.app/Contents/Resources
-	@cp .build/apple/Products/Release/mac-runner build/MacRunner.app/Contents/MacOS/MacRunner
+	@# Where multi-arch products land depends on the toolchain, so ask SwiftPM.
+	@cp "$$(swift build $(RELEASE_FLAGS) --show-bin-path)/mac-runner" build/MacRunner.app/Contents/MacOS/MacRunner
 	@./scripts/generate-info-plist.sh > build/MacRunner.app/Contents/Info.plist
 	@codesign --force --sign - --entitlements scripts/MacRunner.entitlements build/MacRunner.app
 	@echo "App bundle created at build/MacRunner.app"

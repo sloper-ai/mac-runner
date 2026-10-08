@@ -65,7 +65,7 @@ struct UpdateInstaller: Sendable {
         case .homebrewFormula:
             packageArguments = ["upgrade", "mac-runner"]
         case .homebrewCask:
-            packageArguments = ["upgrade", "--cask", "mac-runner"]
+            packageArguments = ["upgrade", "--cask", UpdateSource.homebrewCask]
         case .directDownload:
             throw UpdateInstallerError.automaticUpdateUnavailable
         }

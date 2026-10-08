@@ -69,8 +69,8 @@ Result: No release
 2. **Determine version** - Based on commit types (feat/fix/etc)
 3. **Generate CHANGELOG** - Automatic changelog from commits
 4. **Build binaries** - Universal Mac app (arm64 + x86_64)
-5. **Create release** - GitHub release with DMG and ZIP
-6. **Update cask** - Homebrew formula with new SHA256
+5. **Create release** - GitHub release with the zipped app
+6. **Update cask** - `Casks/mac-runner.rb` gets the new version and SHA-256 (this repository is the Homebrew tap; see [RELEASING.md](RELEASING.md))
 
 ## Release Process
 
@@ -87,8 +87,8 @@ GitHub Actions will:
 - Determine next version (0.1.0 → 0.2.0)
 - Build universal binary
 - Create GitHub release v0.2.0
-- Upload DMG and ZIP
-- Update Homebrew cask
+- Upload the zipped app
+- Update the Homebrew cask in this repository
 - Generate CHANGELOG.md
 
 ### Manual Release
