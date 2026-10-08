@@ -67,6 +67,11 @@ class RunnerManager: ObservableObject {
     private(set) var currentSettings: AppSettings = .default
     private var statusPollingTask: Task<Void, Never>?
     private var runnersToAutoRestart: Set<UUID> = []
+    /// Runners autoRestartRunners is still about to start (Docker ones wait for Docker).
+    private var autoRestartPendingIDs: Set<UUID> = []
+    /// JIT runners whose exit this process is handling: deleting the spent
+    /// registration, then starting the next one.
+    private var jitCyclingRunnerIDs: Set<UUID> = []
     private var activeWorkflowJobs: [UUID: WorkflowJobSummary] = [:]
     /// Names reserved by in-flight addRunner calls to prevent duplicate naming race conditions.
     private var pendingRunnerNames: Set<String> = []
@@ -464,8 +469,11 @@ class RunnerManager: ObservableObject {
 
         let ids = runnersToAutoRestart
         runnersToAutoRestart.removeAll()
+        // Until each is started, the JIT supervisor leaves it to us.
+        autoRestartPendingIDs.formUnion(ids)
 
         func restart(_ id: UUID) async {
+            defer { autoRestartPendingIDs.remove(id) }
             do {
                 try await startRunner(id)
             } catch {
@@ -512,6 +520,10 @@ class RunnerManager: ObservableObject {
     ///   - containerEngine: Container isolation: engine to run it with (nil uses Apple's)
     ///   - containerCPUs: Container isolation: CPUs for the container (nil uses the default)
     ///   - containerMemoryMB: Container isolation: memory for the container, in MB (nil uses the default)
+    ///   - jit: Register a single-use (JIT) runner at each start instead of one long-lived runner
+    ///   - containerToolsOverride: Container isolation: tools to install at each start
+    ///     instead of the detected ones ([] = none)
+    ///   - containerCachePaths: Docker engine: container paths kept in cache volumes
     /// - Throws: RunnerError if validation or setup fails
     func addRunner(
         name: String,
@@ -524,7 +536,10 @@ class RunnerManager: ObservableObject {
         containerImage: String? = nil,
         containerEngine: ContainerEngine? = nil,
         containerCPUs: Int? = nil,
-        containerMemoryMB: Int? = nil
+        containerMemoryMB: Int? = nil,
+        jit: Bool = false,
+        containerToolsOverride: [String]? = nil,
+        containerCachePaths: [String]? = nil
     ) async throws {
         isLoading = true
         defer { isLoading = false }
@@ -538,7 +553,8 @@ class RunnerManager: ObservableObject {
             status: .stopped,
             isolationMode: isolationMode,
             enableGUI: enableGUI,
-            openFileLimit: openFileLimit
+            openFileLimit: openFileLimit,
+            jit: jit
         )
 
         let effectiveIsolation = runner.effectiveIsolationMode(global: currentSettings.isolationMode)
@@ -548,6 +564,15 @@ class RunnerManager: ObservableObject {
             runner.containerEngine = containerEngine
             runner.containerCPUs = containerCPUs
             runner.containerMemoryMB = containerMemoryMB
+            runner.containerToolsOverride = containerToolsOverride
+        }
+        if let containerCachePaths, !containerCachePaths.isEmpty {
+            guard runner.runsInDocker(global: currentSettings.isolationMode) else { throw RunnerError.cacheNeedsDocker }
+            runner.containerCachePaths = try DockerRunnerEngine.cachePaths(containerCachePaths).get()
+        }
+        if runner.isJIT && labels.isEmpty {
+            // GitHub gives a JIT runner exactly the labels it's registered with.
+            throw RunnerError.jitNeedsLabels
         }
         if runner.runsInDocker(global: currentSettings.isolationMode) {
             // Fail before anything is registered or saved.
@@ -576,11 +601,15 @@ class RunnerManager: ObservableObject {
 
         if effectiveIsolation == .container {
             // The Linux runner registers from inside its container when it starts;
-            // decide now which tools that container installs.
+            // decide now which tools that container installs. (Detected even when
+            // the runner names its own, so dropping those later goes back to these.)
             runner.containerTools = await toolProvisioningService.containerToolPlan(
                 for: scope == .repo ? repo : nil,
                 settings: currentSettings.tools
             )
+        } else if runner.isJIT {
+            // Download only: a JIT runner registers each time it starts.
+            try await RunnerInstaller.shared.prepareRunner(runnerId: runner.id, isolation: effectiveIsolation)
         } else {
             // Get registration token from GitHub via gh CLI
             let registrationToken = try await ghService.getRegistrationToken(for: target)
@@ -597,8 +626,10 @@ class RunnerManager: ObservableObject {
         }
 
         // Look up the GitHub-assigned runner ID so we can delete it later
+        // (a JIT runner's comes with each registration).
         var registeredRunner = runner
-        if let remoteRunners = try? await ghService.listRemoteRunners(for: target),
+        if !runner.isJIT,
+           let remoteRunners = try? await ghService.listRemoteRunners(for: target),
            let match = remoteRunners.first(where: { $0.name == name }) {
             registeredRunner.githubRunnerId = match.id
         }
@@ -634,15 +665,22 @@ class RunnerManager: ObservableObject {
         // Remove from GitHub via gh CLI. Container runners register from inside
         // their container; their ID is recorded once they come online. Without
         // one, only an offline registration with this name is removed, so a live
-        // runner we can't tie to this one is never touched.
+        // runner we can't tie to this one is never touched. A JIT runner's
+        // registration went when it stopped; offline ones left by its earlier
+        // starts (Mac Runner killed mid-cycle, say) go too.
         if let runner = runners.first(where: { $0.id == id }) {
-            var githubRunnerId = runner.githubRunnerId
-            if githubRunnerId == nil,
+            var githubRunnerIds = runner.githubRunnerId.map { [$0] } ?? []
+            if githubRunnerIds.isEmpty || runner.isJIT,
                let remote = try? await ghService.listRemoteRunners(for: runner.target) {
-                githubRunnerId = Self.offlineRegistration(named: runner.name, in: remote)?.id
+                if githubRunnerIds.isEmpty, let offline = Self.offlineRegistration(named: runner.name, in: remote) {
+                    githubRunnerIds.append(offline.id)
+                }
+                if runner.isJIT {
+                    githubRunnerIds += JITRunner.leftoverRegistrations(of: runner.name, in: remote).map(\.id)
+                }
             }
-            if let ghId = githubRunnerId {
-                try? await ghService.deleteRunner(target: runner.target, githubRunnerId: ghId)
+            for ghId in Set(githubRunnerIds) {
+                _ = try? await ghService.deleteRunnerIfPresent(target: runner.target, githubRunnerId: ghId)
             }
         }
 
@@ -652,9 +690,9 @@ class RunnerManager: ObservableObject {
         if let runner = runners.first(where: { $0.id == id }) {
             let isolation = runner.effectiveIsolationMode(global: currentSettings.isolationMode)
             if isolation == .container {
-                // On Docker, _work is a volume. Checked whatever the engine, in
-                // case the runner used Docker before it switched.
-                await DockerRunnerEngine.removeContainerAndWorkVolume(for: id)
+                // On Docker, _work and caches are volumes. Checked whatever the
+                // engine, in case the runner used Docker before it switched.
+                await DockerRunnerEngine.removeContainerAndVolumes(for: id)
             }
             do {
                 try RunnerDirectory.remove(for: id, isolation: isolation)
@@ -669,6 +707,7 @@ class RunnerManager: ObservableObject {
 
         // Clean up PID file
         pidManager.removePID(for: id)
+        RunnerStartLock.removeFile(for: id)
         manualStopRequests.remove(id)
         launchTokens.removeValue(forKey: id)
         scheduledRestarts[id]?.cancel()
@@ -689,12 +728,30 @@ class RunnerManager: ObservableObject {
     /// process (Apple's engine), or with a background `docker run` (Docker). For process-based
     /// isolation, launches the runner as a background process. Updates the runner's status to running.
     ///
+    /// A JIT runner registers a single-use runner first (deleting any registration it
+    /// still has on record) and gets a fresh workspace; the JIT config reaches the runner
+    /// through its environment only (see `JITRunner`).
+    ///
     /// - Parameter id: UUID of the runner to start
     /// - Throws: RunnerError if the runner is not found, already running, or if startup fails
     func startRunner(_ id: UUID) async throws {
+        try await startRunner(id, holdingStartLock: false)
+    }
+
+    /// - Parameter holdingStartLock: The caller holds the runner's `RunnerStartLock` already.
+    private func startRunner(_ id: UUID, holdingStartLock: Bool) async throws {
         guard let index = runners.firstIndex(where: { $0.id == id }) else {
             throw RunnerError.notFound
         }
+
+        // A JIT runner registers on GitHub as it starts: one start at a time across
+        // Mac Runner processes, and a stop anywhere waits for it.
+        var startLock: RunnerStartLock?
+        if runners[index].isJIT && !holdingStartLock {
+            guard let lock = RunnerStartLock.tryAcquire(for: id) else { throw RunnerError.startInProgress }
+            startLock = lock
+        }
+        defer { startLock?.unlock() }
 
         // Check if already running via in-memory process or PID file
         if runnerProcesses[id] != nil || processManager.isProcessAlive(for: id) {
@@ -723,177 +780,233 @@ class RunnerManager: ObservableObject {
         // Ensure runner binary is downloaded and configured
         if needsRunnerSetup {
             try await validateGitHubAuth(for: runner, operation: "start runner")
-            let registrationToken = try await ghService.getRegistrationToken(for: runner.target)
-            try await RunnerInstaller.shared.setupRunner(
-                target: runner.target,
-                registrationToken: registrationToken,
-                name: runner.name,
-                labels: runner.labels,
-                runnerId: id,
-                isolation: isolation
-            )
+            if runner.isJIT {
+                // Registered below, for this start only.
+                try await RunnerInstaller.shared.prepareRunner(runnerId: id, isolation: isolation)
+            } else {
+                let registrationToken = try await ghService.getRegistrationToken(for: runner.target)
+                try await RunnerInstaller.shared.setupRunner(
+                    target: runner.target,
+                    registrationToken: registrationToken,
+                    name: runner.name,
+                    labels: runner.labels,
+                    runnerId: id,
+                    isolation: isolation
+                )
+            }
         }
 
         // Launch runner as a background process that survives the parent (CLI) exiting.
         let logFile = "\(runnerDir)/runner.log"
+        // This start's JIT registration, once made: deleted again if the launch fails.
+        var jitRegistration: JITRegistration?
 
-        if usesDocker(runner) {
-            // Docker: the launcher runs `docker run` as a background process.
-            try await validateGitHubAuth(for: runner, operation: "start runner")
-            let (docker, daemon) = try await DockerRunnerEngine.requireRunningDaemon()
-            let cpus = try DockerRunnerEngine.cpus(for: runner, dockerCPUs: daemon.cpuCount)
-            let registrationToken = try await ghService.getRegistrationToken(for: runner.target)
-            let runnerVersion = await RunnerInstaller.shared.resolveRunnerVersion()
-            let openFileLimit = runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit)
-            let variables = ContainerRunnerScript.variables(
-                registrationURL: runner.target.registrationURL,
-                registrationToken: registrationToken,
-                runnerName: runner.name,
-                labels: runner.labels,
-                runnerDownloadURL: RunnerInstaller.linuxDownloadURL(version: runnerVersion),
-                openFileLimit: openFileLimit,
-                tools: runner.containerTools ?? [],
-                enableGUI: runner.enableGUI
-            ) + DockerRunnerEngine.engineVariables
-
-            _ = try Self.makeDirectory(runnerDir, "_diag")
-            let launcher = try DockerRunnerEngine.writeLaunchFiles(
-                docker: docker,
-                runnerID: id,
-                runnerName: runner.name,
-                runnerDirectory: runnerDir,
-                image: runner.containerImage ?? ContainerRunnerConfiguration.defaultRunnerImage,
-                cpus: cpus,
-                memoryMB: runner.effectiveContainerMemoryMB,
-                openFileLimit: openFileLimit,
-                environmentNames: variables.map(\.name)
-            )
-            let process = try processManager.startProcess(
-                for: id,
-                executable: launcher,
-                workingDirectory: runnerDir,
-                logFile: logFile,
-                isolation: isolation,
-                enableGUI: runner.enableGUI,
-                openFileLimit: openFileLimit,
-                // The token reaches the container through the environment only.
-                extraEnvironment: Dictionary(variables.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last })
-            )
-            track(process, for: id, launchToken: launchToken)
-            recordGitHubRunnerIDOnceOnline(id)
-        } else if case .container = isolation {
-            // Container isolation requires special handling
-            try await validateGitHubAuth(for: runner, operation: "start runner")
-            // Container-based isolation (macOS 26+)
-            #if canImport(Containerization)
-            if #available(macOS 26.0, *) {
-                // Wait for container service initialization to complete if still in progress
-                if let initTask = containerServiceInitializationTask {
-                    _ = await initTask.value
-                }
-
-                guard let containerService = containerService else {
-                    if let initializationError = containerServiceInitializationError {
-                        throw initializationError
-                    }
-                    throw RunnerError.containerServiceNotAvailable
-                }
-
-                // Get registration token for container configuration
-                let registrationToken = try await ghService.getRegistrationToken(for: runner.target)
-
-                // Create container configuration. `repositoryURL` is the value passed to
-                // `config.sh --url` inside the container, so it must point at the org or
-                // repo depending on the runner's scope.
+        do {
+            if usesDocker(runner) {
+                // Docker: the launcher runs `docker run` as a background process.
+                try await validateGitHubAuth(for: runner, operation: "start runner")
+                let (docker, daemon) = try await DockerRunnerEngine.requireRunningDaemon()
+                let cpus = try DockerRunnerEngine.cpus(for: runner, dockerCPUs: daemon.cpuCount)
                 let runnerVersion = await RunnerInstaller.shared.resolveRunnerVersion()
-                let resources = ContainerRunnerConfiguration.resources(for: runner)
-                let containerConfig = ContainerRunnerConfiguration(
-                    containerImage: runner.containerImage,
-                    cpuCount: resources.cpuCount,  // default 2
-                    memoryInBytes: resources.memoryInBytes,  // default 4 GiB
-                    diskSizeInBytes: 16 * 1024 * 1024 * 1024,  // 16 GiB (sparse)
-                    enableNestedVirtualization: false,
-                    // Mount only _work and _diag, so runner.log and diagnostics sit
-                    // in the runner directory like other modes and stay out of jobs' view.
-                    workspaceURL: try Self.makeDirectory(runnerDir, "_work"),
-                    diagnosticsURL: try Self.makeDirectory(runnerDir, "_diag"),
-                    repositoryURL: runner.target.registrationURL,
-                    registrationToken: registrationToken,
+                let openFileLimit = runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit)
+                let registration: ContainerRunnerScript.Registration
+                if runner.isJIT {
+                    let jit = try await registerJITRunner(runner, workFolder: ContainerRunnerScript.workMount)
+                    jitRegistration = jit.registration
+                    registration = .jitConfig(jit.config)
+                } else {
+                    registration = .token(try await ghService.getRegistrationToken(for: runner.target))
+                }
+                let cachePaths = runner.containerCachePaths ?? []
+                let variables = ContainerRunnerScript.variables(
+                    registrationURL: runner.target.registrationURL,
+                    registration: registration,
                     runnerName: runner.name,
                     labels: runner.labels,
-                    tools: runner.containerTools ?? [],
-                    enableGUI: runner.enableGUI,
                     runnerDownloadURL: RunnerInstaller.linuxDownloadURL(version: runnerVersion),
-                    openFileLimit: runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit),
-                    logWriter: try {
-                        RunnerLogs.rotateIfNeeded(logFile)
-                        RunnerLogs.pruneDiagnostics(runnerDirectory: runnerDir)
-                        // Fail the start rather than run a container whose output goes nowhere.
-                        return try FileLogWriter(path: logFile)
-                    }()
+                    openFileLimit: openFileLimit,
+                    tools: runner.effectiveContainerTools,
+                    enableGUI: runner.enableGUI,
+                    cacheDirectories: cachePaths
+                ) + DockerRunnerEngine.engineVariables
+
+                _ = try Self.makeDirectory(runnerDir, "_diag")
+                let launcher = try DockerRunnerEngine.writeLaunchFiles(
+                    docker: docker,
+                    runnerID: id,
+                    runnerName: runner.name,
+                    runnerDirectory: runnerDir,
+                    image: runner.containerImage ?? ContainerRunnerConfiguration.defaultRunnerImage,
+                    cpus: cpus,
+                    memoryMB: runner.effectiveContainerMemoryMB,
+                    openFileLimit: openFileLimit,
+                    environmentNames: variables.map(\.name),
+                    // A JIT runner's job gets an empty work volume; caches stay.
+                    resetWorkVolume: runner.isJIT,
+                    cacheMounts: DockerRunnerEngine.cacheMounts(for: id, paths: cachePaths)
                 )
-
-                // Create and start container
-                let container = try await containerService.createRunnerContainer(
-                    id: id.uuidString,
-                    config: containerConfig
+                let process = try processManager.startProcess(
+                    for: id,
+                    executable: launcher,
+                    workingDirectory: runnerDir,
+                    logFile: logFile,
+                    isolation: isolation,
+                    enableGUI: runner.enableGUI,
+                    openFileLimit: openFileLimit,
+                    // The token or JIT config reaches the container through the environment only.
+                    extraEnvironment: Dictionary(variables.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last })
                 )
-                try await containerService.startContainer(container)
+                track(process, for: id, launchToken: launchToken)
+                if !runner.isJIT {
+                    recordGitHubRunnerIDOnceOnline(id)
+                }
+            } else if case .container = isolation {
+                // Container isolation requires special handling
+                try await validateGitHubAuth(for: runner, operation: "start runner")
+                // Container-based isolation (macOS 26+)
+                #if canImport(Containerization)
+                if #available(macOS 26.0, *) {
+                    // Wait for container service initialization to complete if still in progress
+                    if let initTask = containerServiceInitializationTask {
+                        _ = await initTask.value
+                    }
 
-                // Store container reference
-                runnerContainers[id] = container
-                launchTokens[id] = launchToken
-                // The VM lives in this process; record it so other Mac Runner
-                // processes see the runner as running rather than stale.
-                try? pidManager.writePID(ProcessInfo.processInfo.processIdentifier, for: id)
-                recordGitHubRunnerIDOnceOnline(id)
-
-                // Monitor container in background
-                Task {
-                    do {
-                        #if canImport(Containerization)
-                        if let linuxContainer = container as? LinuxContainer {
-                            let exitStatus = try await linuxContainer.wait()
-                            print("Container \(id.uuidString) exited with code: \(exitStatus.exitCode)")
-                            await MainActor.run {
-                                handleRunnerTermination(id, launchToken: launchToken, cause: .containerExit(status: Int(exitStatus.exitCode)))
-                            }
-                        } else {
-                            await MainActor.run {
-                                handleRunnerTermination(id, launchToken: launchToken, cause: .monitoringError(message: "Container handle unavailable"))
-                            }
+                    guard let containerService = containerService else {
+                        if let initializationError = containerServiceInitializationError {
+                            throw initializationError
                         }
-                        #endif
-                    } catch {
-                        await MainActor.run {
-                            handleRunnerTermination(id, launchToken: launchToken, cause: .monitoringError(message: error.localizedDescription))
+                        throw RunnerError.containerServiceNotAvailable
+                    }
+
+                    // Mount only _work and _diag, so runner.log and diagnostics sit
+                    // in the runner directory like other modes and stay out of jobs' view.
+                    let workspaceURL = URL(fileURLWithPath: runnerDir).appendingPathComponent("_work", isDirectory: true)
+                    // Get registration token (or a JIT config) for container configuration
+                    var registrationToken = ""
+                    var jitConfig: String?
+                    if runner.isJIT {
+                        // A fresh workspace for every job.
+                        try await Self.resetDirectory(workspaceURL)
+                        let jit = try await registerJITRunner(runner, workFolder: ContainerRunnerScript.workMount)
+                        jitRegistration = jit.registration
+                        jitConfig = jit.config
+                    } else {
+                        registrationToken = try await ghService.getRegistrationToken(for: runner.target)
+                    }
+
+                    // Create container configuration. `repositoryURL` is the value passed to
+                    // `config.sh --url` inside the container, so it must point at the org or
+                    // repo depending on the runner's scope.
+                    let runnerVersion = await RunnerInstaller.shared.resolveRunnerVersion()
+                    let resources = ContainerRunnerConfiguration.resources(for: runner)
+                    let containerConfig = ContainerRunnerConfiguration(
+                        containerImage: runner.containerImage,
+                        cpuCount: resources.cpuCount,  // default 2
+                        memoryInBytes: resources.memoryInBytes,  // default 4 GiB
+                        diskSizeInBytes: 16 * 1024 * 1024 * 1024,  // 16 GiB (sparse)
+                        enableNestedVirtualization: false,
+                        workspaceURL: try Self.makeDirectory(runnerDir, "_work"),
+                        diagnosticsURL: try Self.makeDirectory(runnerDir, "_diag"),
+                        repositoryURL: runner.target.registrationURL,
+                        registrationToken: registrationToken,
+                        jitConfig: jitConfig,
+                        runnerName: runner.name,
+                        labels: runner.labels,
+                        tools: runner.effectiveContainerTools,
+                        enableGUI: runner.enableGUI,
+                        runnerDownloadURL: RunnerInstaller.linuxDownloadURL(version: runnerVersion),
+                        openFileLimit: runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit),
+                        logWriter: try {
+                            RunnerLogs.rotateIfNeeded(logFile)
+                            RunnerLogs.pruneDiagnostics(runnerDirectory: runnerDir)
+                            // Fail the start rather than run a container whose output goes nowhere.
+                            return try FileLogWriter(path: logFile)
+                        }()
+                    )
+
+                    // Create and start container
+                    let container = try await containerService.createRunnerContainer(
+                        id: id.uuidString,
+                        config: containerConfig
+                    )
+                    try await containerService.startContainer(container)
+
+                    // Store container reference
+                    runnerContainers[id] = container
+                    launchTokens[id] = launchToken
+                    // The VM lives in this process; record it so other Mac Runner
+                    // processes see the runner as running rather than stale.
+                    try? pidManager.writePID(ProcessInfo.processInfo.processIdentifier, for: id)
+                    if !runner.isJIT {
+                        recordGitHubRunnerIDOnceOnline(id)
+                    }
+
+                    // Monitor container in background
+                    Task {
+                        do {
+                            #if canImport(Containerization)
+                            if let linuxContainer = container as? LinuxContainer {
+                                let exitStatus = try await linuxContainer.wait()
+                                print("Container \(id.uuidString) exited with code: \(exitStatus.exitCode)")
+                                await MainActor.run {
+                                    handleRunnerTermination(id, launchToken: launchToken, cause: .containerExit(status: Int(exitStatus.exitCode)))
+                                }
+                            } else {
+                                await MainActor.run {
+                                    handleRunnerTermination(id, launchToken: launchToken, cause: .monitoringError(message: "Container handle unavailable"))
+                                }
+                            }
+                            #endif
+                        } catch {
+                            await MainActor.run {
+                                handleRunnerTermination(id, launchToken: launchToken, cause: .monitoringError(message: error.localizedDescription))
+                            }
                         }
                     }
+                } else {
+                    throw RunnerError.containerServiceNotAvailable
                 }
-            } else {
+                #else
                 throw RunnerError.containerServiceNotAvailable
+                #endif
+            } else {
+                // Standard process-based isolation (.none or .dedicatedUser)
+                var jitConfig: String?
+                if runner.isJIT {
+                    // The launch wipes _work and hands run.sh the config (see JITRunner).
+                    try await validateGitHubAuth(for: runner, operation: "start runner")
+                    let jit = try await registerJITRunner(runner, workFolder: "_work")
+                    jitRegistration = jit.registration
+                    jitConfig = jit.config
+                }
+                let process = try processManager.startProcess(
+                    for: id,
+                    executable: "\(runnerDir)/run.sh",
+                    workingDirectory: runnerDir,
+                    logFile: logFile,
+                    isolation: isolation,
+                    enableGUI: runner.enableGUI,
+                    openFileLimit: runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit),
+                    jitConfig: jitConfig
+                )
+                track(process, for: id, launchToken: launchToken)
             }
-            #else
-            throw RunnerError.containerServiceNotAvailable
-            #endif
-        } else {
-            // Standard process-based isolation (.none or .dedicatedUser)
-            let process = try processManager.startProcess(
-                for: id,
-                executable: "\(runnerDir)/run.sh",
-                workingDirectory: runnerDir,
-                logFile: logFile,
-                isolation: isolation,
-                enableGUI: runner.enableGUI,
-                openFileLimit: runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit)
-            )
-            track(process, for: id, launchToken: launchToken)
+        } catch {
+            if let jitRegistration {
+                // It never ran: don't leave the registration behind.
+                await retireRegistration(jitRegistration.id, of: id)
+            }
+            throw error
         }
 
         // The runner list can be replaced while we awaited (e.g. a config
         // reload after the CLI removed another runner), so look it up again.
         guard let index = runners.firstIndex(where: { $0.id == id }) else { return }
 
+        if let jitRegistration {
+            // Marks this start in runner.log, so its exit can tell whether a job ran.
+            logRunnerEvent(for: runners[index], message: JITRunner.startMessage(for: jitRegistration))
+        }
         // A freshly started runner hasn't picked up a job yet.
         runners[index].busy = false
         if let reason = runners[index].autoPauseReason {
@@ -911,6 +1024,7 @@ class RunnerManager: ObservableObject {
     /// For container-based runners, stops and deletes the container. For process-based runners,
     /// terminates the process tree using the appropriate method for the isolation mode.
     /// Docker runners are stopped like processes, then their container is removed.
+    /// A JIT runner's registration is deleted too, even when it was between jobs.
     /// Updates the runner's status to stopped.
     ///
     /// - Parameter id: UUID of the runner to stop
@@ -920,9 +1034,28 @@ class RunnerManager: ObservableObject {
             throw RunnerError.notFound
         }
 
-        let runner = runners[index]
+        var runner = runners[index]
         // Use per-runner isolation mode if specified, otherwise use global setting
         let isolation = runner.effectiveIsolationMode(global: currentSettings.isolationMode)
+
+        // Whichever Mac Runner process watches a JIT runner starts the next one
+        // after each exit while its status says running. So say it's stopped
+        // first, on disk too; then wait out a start in progress (here or in
+        // another process) and look again, so the registration deleted below is
+        // the one it ended up with. (Not for a VM another process hosts, which
+        // only that process can stop.)
+        var startLock: RunnerStartLock?
+        if runner.isJIT && !appleVMIsHostedElsewhere(runner) {
+            markStopped(id)
+            startLock = await RunnerStartLock.acquire(for: id, waitingUpTo: 60)
+            reloadExternalConfigChanges()
+            guard let current = runners.first(where: { $0.id == id }) else { return }  // removed meanwhile
+            runner = current
+            // A start that finished while we waited said running again.
+            markStopped(id)
+        }
+        defer { startLock?.unlock() }
+
         manualStopRequests.insert(id)
         activeWorkflowJobs.removeValue(forKey: id)
 
@@ -964,6 +1097,9 @@ class RunnerManager: ObservableObject {
                     runnerProcesses.removeValue(forKey: id)
                 }
             }
+        } catch RunnerError.notRunning where runner.isJIT {
+            // Between jobs nothing runs, but its registration still goes, below.
+            manualStopRequests.remove(id)
         } catch {
             manualStopRequests.remove(id)
             throw error
@@ -973,6 +1109,14 @@ class RunnerManager: ObservableObject {
         scheduledRestarts.removeValue(forKey: id)
         restartAttemptHistory.removeValue(forKey: id)
         launchTokens.removeValue(forKey: id)
+
+        if runner.isJIT {
+            // Never leave an idle single-use registration behind.
+            await retireRecordedRegistration(of: id)
+            if isolation != .container {
+                await Self.removeJITCredentials(runnerID: id, isolation: isolation)
+            }
+        }
 
         // Look the runner up again: the list can be replaced during the awaits above.
         guard let index = runners.firstIndex(where: { $0.id == id }) else { return }
@@ -1034,6 +1178,7 @@ class RunnerManager: ObservableObject {
         jobLogScanTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.scanJobLogs()
+                self?.superviseDetachedJITRunners()
                 try? await Task.sleep(for: .seconds(2))
             }
         }
@@ -1256,8 +1401,11 @@ class RunnerManager: ObservableObject {
             return Target(id: runner.id, pid: pid, directory: directory)
         }
         let docker = dockerContainers.isEmpty ? nil : DockerRunnerEngine.executablePath()
-        let dockerVolumes = dockerContainers.keys.reduce(into: [UUID: String]()) { volumes, id in
-            volumes[id] = DockerRunnerEngine.workVolumeName(for: id)
+        // Its work volume and any cache volumes.
+        let dockerVolumes = dockerContainers.keys.reduce(into: [UUID: [String]]()) { volumes, id in
+            let cachePaths = runners.first(where: { $0.id == id })?.containerCachePaths ?? []
+            volumes[id] = [DockerRunnerEngine.workVolumeName(for: id)]
+                + DockerRunnerEngine.cacheMounts(for: id, paths: cachePaths).map(\.volume)
         }
 
         let wantsDisk = measureDisk || lastDiskMeasurement.map { now.timeIntervalSince($0) >= 300 } ?? true
@@ -1270,11 +1418,12 @@ class RunnerManager: ObservableObject {
                     let volumeSizes = docker.flatMap { ResourceMonitor.dockerVolumeSizes(docker: $0) }
                     return targets.map { target -> (UUID, ResourceMonitor.DiskMeasurement?) in
                         let size = ResourceMonitor.directorySize(target.directory)
-                        guard let volume = dockerVolumes[target.id] else { return (target.id, size) }
-                        let volumeSize = volumeSizes?[volume]
+                        guard let volumes = dockerVolumes[target.id] else { return (target.id, size) }
+                        let volumeBytes = volumes.map { volumeSizes?[$0] }
                         return (target.id, ResourceMonitor.DiskMeasurement(
-                            bytes: (size?.bytes ?? 0) + (volumeSize ?? 0),
-                            isComplete: size?.isComplete == true && volumeSize != nil
+                            bytes: (size?.bytes ?? 0) + volumeBytes.reduce(0) { $0 + ($1 ?? 0) },
+                            // The work volume is only missing while its container starts.
+                            isComplete: size?.isComplete == true && volumeBytes.allSatisfy { $0 != nil }
                         ))
                     }
                 }.value
@@ -1554,13 +1703,16 @@ class RunnerManager: ObservableObject {
     private func update(_ runner: Runner, to desired: DesiredRunner, restart: Bool) async throws -> String? {
         guard let index = runners.firstIndex(where: { $0.id == runner.id }) else { throw RunnerError.notFound }
         // A runner is stopped the way its engine started it, so a running one
-        // switches engine only once it has stopped.
+        // switches engine only once it has stopped. Likewise JIT: stopping a JIT
+        // runner deletes its registration; stopping a long-lived one doesn't.
         let wantedEngine = desired.containerEngine ?? .apple
         let switchesEngine = runners[index].effectiveContainerEngine != wantedEngine
+        let switchesJIT = runners[index].isJIT != desired.jit
         if switchesEngine && restart && wantedEngine == .docker {
             // Don't stop it for an engine that can't start it.
             _ = try await DockerRunnerEngine.requireRunningDaemon()
         }
+        let previousCachePaths = runners[index].containerCachePaths ?? []
         runners[index].isolationMode = desired.isolation
         runners[index].enableGUI = desired.enableGUI
         runners[index].openFileLimit = desired.openFileLimit
@@ -1568,26 +1720,99 @@ class RunnerManager: ObservableObject {
         runners[index].containerImage = desired.containerImage
         runners[index].containerCPUs = desired.containerCPUs
         runners[index].containerMemoryMB = desired.containerMemoryMB
+        runners[index].containerToolsOverride = desired.containerToolsOverride
+        runners[index].containerCachePaths = desired.containerCachePaths.flatMap { $0.isEmpty ? nil : $0 }
         if !(switchesEngine && restart) {
             runners[index].containerEngine = desired.containerEngine
         }
+        if !(switchesJIT && restart) {
+            runners[index].jit = desired.jit ? true : nil
+        }
         saveConfiguration()
-        guard restart else { return nil }
+        let dropsCaches = !Set(previousCachePaths).isSubset(of: Set(desired.containerCachePaths ?? []))
+        guard restart else {
+            if switchesJIT {
+                try await prepareRegistrationSwitch(runner.id)
+            }
+            if dropsCaches {
+                await DockerRunnerEngine.removeCacheVolumes(for: runner.id, keeping: desired.containerCachePaths ?? [])
+            }
+            return nil
+        }
 
         // Don't interrupt a job; the change applies the next time the runner starts.
+        let registeredName = runners.first(where: { $0.id == runner.id })?.registeredName ?? runner.name
         if let remote = try? await ghService.listRemoteRunners(for: runner.target),
-           remote.first(where: { $0.name == runner.name })?.busy == true {
-            return switchesEngine
-                ? "engine change deferred: a job is running (run `mac-runner apply` again once it's idle)"
+           remote.first(where: { $0.name == registeredName })?.busy == true {
+            let switches = [switchesEngine ? "engine" : nil, switchesJIT ? "jit" : nil].compactMap { $0 }
+            if !switches.isEmpty {
+                return "\(switches.joined(separator: " and ")) change deferred: a job is running (run `mac-runner apply` again once it's idle)"
+            }
+            return runner.isJIT
+                ? "applies from the next job: one is running"
                 : "restart deferred: a job is running (takes effect when the runner next starts)"
         }
         try await stopRunner(runner.id)
-        if switchesEngine, let index = runners.firstIndex(where: { $0.id == runner.id }) {
-            runners[index].containerEngine = desired.containerEngine
+        if switchesEngine || switchesJIT, let index = runners.firstIndex(where: { $0.id == runner.id }) {
+            if switchesEngine {
+                runners[index].containerEngine = desired.containerEngine
+            }
+            if switchesJIT {
+                runners[index].jit = desired.jit ? true : nil
+            }
             saveConfiguration()
+        }
+        if switchesJIT {
+            try await prepareRegistrationSwitch(runner.id)
+        }
+        if dropsCaches {
+            // Its old container is gone, so their volumes are free.
+            await DockerRunnerEngine.removeCacheVolumes(for: runner.id, keeping: desired.containerCachePaths ?? [])
         }
         try await startRunner(runner.id)
         return nil
+    }
+
+    /// After `jit` changed on a runner that isn't running: leave it ready to
+    /// register the new way when it next starts.
+    private func prepareRegistrationSwitch(_ id: UUID) async throws {
+        guard let runner = runners.first(where: { $0.id == id }) else { return }
+        let isolation = runner.effectiveIsolationMode(global: currentSettings.isolationMode)
+        if runner.isJIT {
+            // Its long-lived registration goes now; an unrecorded one is found by name.
+            if runner.githubRunnerId != nil {
+                await retireRecordedRegistration(of: id)
+            } else if let remote = try? await ghService.listRemoteRunners(for: runner.target),
+                      let offline = Self.offlineRegistration(named: runner.name, in: remote) {
+                _ = try? await ghService.deleteRunnerIfPresent(target: runner.target, githubRunnerId: offline.id)
+            }
+            return
+        }
+
+        // Long-lived again. A container runner registers itself at each start; a
+        // process runner drops the last JIT run's files and registers once more.
+        await retireRecordedRegistration(of: id)
+        guard isolation != .container else { return }
+        await Self.removeJITCredentials(runnerID: id, isolation: isolation)
+        let directory = RunnerDirectory.directoryURL(for: id, isolation: isolation).path
+        // Without run.sh, the next start downloads and registers it anyway.
+        guard FileManager.default.fileExists(atPath: "\(directory)/run.sh") else { return }
+        try await validateGitHubAuth(for: runner, operation: "register runner")
+        let registrationToken = try await ghService.getRegistrationToken(for: runner.target)
+        try await RunnerInstaller.shared.configureRunner(
+            at: directory,
+            target: runner.target,
+            registrationToken: registrationToken,
+            name: runner.name,
+            labels: runner.labels,
+            isolation: isolation
+        )
+        if let remote = try? await ghService.listRemoteRunners(for: runner.target),
+           let match = remote.first(where: { $0.name == runner.name }),
+           let index = runners.firstIndex(where: { $0.id == id }) {
+            runners[index].githubRunnerId = match.id
+            saveConfiguration()
+        }
     }
 
     /// Fail early, before anything is removed, if a runner couldn't be registered.
@@ -1612,7 +1837,10 @@ class RunnerManager: ObservableObject {
             containerImage: desired.containerImage,
             containerEngine: desired.containerEngine,
             containerCPUs: desired.containerCPUs,
-            containerMemoryMB: desired.containerMemoryMB
+            containerMemoryMB: desired.containerMemoryMB,
+            jit: desired.jit,
+            containerToolsOverride: desired.containerToolsOverride,
+            containerCachePaths: desired.containerCachePaths
         )
         if let quietHours = desired.quietHours, let runner = runner(named: desired.name) {
             setQuietHours(quietHours, for: runner.id)
@@ -1629,7 +1857,7 @@ class RunnerManager: ObservableObject {
 
     /// Whether a crash restart is scheduled or a start is in progress.
     func hasPendingRestart(_ id: UUID) -> Bool {
-        scheduledRestarts[id] != nil || startingRunnerIDs.contains(id)
+        scheduledRestarts[id] != nil || startingRunnerIDs.contains(id) || jitCyclingRunnerIDs.contains(id)
     }
 
     nonisolated static func offlineRegistration(named name: String, in remote: [RemoteRunner]) -> RemoteRunner? {
@@ -1697,6 +1925,232 @@ class RunnerManager: ObservableObject {
         await DockerRunnerEngine.removeContainer(for: id)
     }
 
+    // MARK: - JIT Runners
+
+    /// Register this start's single-use runner and record it, after deleting
+    /// whatever registration the runner still has on record (an earlier
+    /// start's, or the long-lived one of a runner that just switched to JIT).
+    private func registerJITRunner(_ runner: Runner, workFolder: String) async throws -> (registration: JITRegistration, config: String) {
+        await retireRecordedRegistration(of: runner.id)
+        let jit = try await ghService.generateJITConfig(
+            for: runner.target,
+            name: JITRunner.registrationName(for: runner.name),
+            labels: runner.labels,
+            workFolder: workFolder,
+            runnerGroupID: JITRunner.runnerGroupID
+        )
+        let registration = JITRegistration(id: jit.runnerID, name: jit.runnerName, createdAt: Date())
+        guard let index = runners.firstIndex(where: { $0.id == runner.id }) else {
+            // Removed while we waited: nothing will run under it.
+            _ = try? await ghService.deleteRunnerIfPresent(target: runner.target, githubRunnerId: registration.id)
+            throw RunnerError.notFound
+        }
+        runners[index].jitRegistration = registration
+        runners[index].githubRunnerId = registration.id
+        saveConfiguration()
+        return (registration, jit.encodedJITConfig)
+    }
+
+    /// Delete the registration the runner has on record (a JIT runner's current
+    /// one, else a long-lived one) and forget it; one GitHub already deleted
+    /// counts. nil when there was none, or deleting failed (that's logged).
+    @discardableResult
+    private func retireRecordedRegistration(of id: UUID) async -> GHCLIService.RunnerDeletion? {
+        guard let runner = runners.first(where: { $0.id == id }),
+              let githubID = runner.jitRegistration?.id ?? runner.githubRunnerId else { return nil }
+        return await retireRegistration(githubID, of: id)
+    }
+
+    @discardableResult
+    private func retireRegistration(_ githubID: Int, of id: UUID) async -> GHCLIService.RunnerDeletion? {
+        guard let runner = runners.first(where: { $0.id == id }) else { return nil }
+        let name = runner.jitRegistration?.id == githubID ? runner.registeredName : runner.name
+        do {
+            let deletion = try await ghService.deleteRunnerIfPresent(target: runner.target, githubRunnerId: githubID)
+            if let index = runners.firstIndex(where: { $0.id == id }) {
+                var changed = false
+                if runners[index].jitRegistration?.id == githubID {
+                    runners[index].jitRegistration = nil
+                    changed = true
+                }
+                if runners[index].githubRunnerId == githubID {
+                    runners[index].githubRunnerId = nil
+                    changed = true
+                }
+                if changed { saveConfiguration() }
+            }
+            return deletion
+        } catch {
+            logRunnerEvent(
+                for: runner,
+                message: "Couldn't delete the registration \(name) (GitHub ID \(githubID)): \(error.localizedDescription) GitHub deletes a single-use runner itself once it has run a job."
+            )
+            return nil
+        }
+    }
+
+    /// Whether `runner` uses Apple's engine and its VM lives in another live
+    /// Mac Runner process (which alone can stop it).
+    private func appleVMIsHostedElsewhere(_ runner: Runner) -> Bool {
+        guard runner.effectiveIsolationMode(global: currentSettings.isolationMode) == .container,
+              !usesDocker(runner), runnerContainers[runner.id] == nil,
+              let host = pidManager.readPID(for: runner.id) else { return false }
+        return host != ProcessInfo.processInfo.processIdentifier && pidManager.isProcessAlive(host)
+    }
+
+    /// Mark a runner stopped, on disk too, so other Mac Runner processes see it.
+    private func markStopped(_ id: UUID) {
+        guard let index = runners.firstIndex(where: { $0.id == id }), runners[index].status != .stopped else { return }
+        runners[index].status = .stopped
+        saveConfiguration()
+    }
+
+    /// Delete what a JIT run leaves in a process runner's directory (its
+    /// registration's credentials), as the service user when it owns it.
+    nonisolated static func removeJITCredentials(runnerID: UUID, isolation: IsolationMode) async {
+        let directory = RunnerDirectory.directoryURL(for: runnerID, isolation: isolation).path
+        var serviceUser: String?
+        if case .dedicatedUser(let username) = isolation { serviceUser = username }
+        await Task.detached(priority: .utility) {
+            JITRunner.removeCredentials(runnerDirectory: directory, serviceUser: serviceUser)
+        }.value
+    }
+
+    /// Delete and recreate a directory, off the main actor (a workspace can be big).
+    nonisolated static func resetDirectory(_ directory: URL) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            let fileManager = FileManager.default
+            if fileManager.fileExists(atPath: directory.path) {
+                // Jobs can leave read-only directories, which can't be emptied as they are.
+                _ = try? ProcessExecutor.run("/bin/chmod", arguments: ["-R", "u+w", directory.path], silent: true)
+                try fileManager.removeItem(at: directory)
+            }
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        }.value
+    }
+
+    /// A JIT runner exited: delete its spent registration, then start the next
+    /// one, or back off as for any crash when it crashed or quit early without
+    /// a job. `cause` is nil when the exit was noticed later, with no Mac Runner
+    /// process watching it.
+    private func handleJITRunnerExit(_ id: UUID, cause: RunnerTerminationCause?) {
+        guard !jitCyclingRunnerIDs.contains(id) else { return }
+        // Held from the exit until the next start, so no other Mac Runner process
+        // takes the runner over meanwhile, and a stop elsewhere waits for us.
+        // Not free: another process is starting it already.
+        guard let startLock = RunnerStartLock.tryAcquire(for: id) else { return }
+        jitCyclingRunnerIDs.insert(id)
+        Task { [weak self] in
+            await self?.finishJITRun(id, cause: cause)
+            startLock.unlock()
+            self?.jitCyclingRunnerIDs.remove(id)
+        }
+    }
+
+    /// The rest of `handleJITRunnerExit`, with the runner's start lock held.
+    private func finishJITRun(_ id: UUID, cause: RunnerTerminationCause?) async {
+        // Another Mac Runner process may have stopped, paused, or removed it.
+        reloadExternalConfigChanges()
+        guard let runner = runners.first(where: { $0.id == id }) else { return }
+        let stillWanted = runner.status == .running && !manualStopRequests.contains(id)
+        guard stillWanted else { return }  // whoever stopped it deletes the registration
+
+        let registration = runner.jitRegistration
+        let ranJobPerLog = registration.flatMap { jitRunRanJob(runner, registration: $0) }
+        // Spent if it ran a job (GitHub deletes those itself: 404), else unused.
+        // (Docker's `--rm` has removed its container.)
+        let deletion = await retireRecordedRegistration(of: id)
+
+        let action = JITRunner.exitAction(
+            stillWanted: true,
+            cleanExit: cause.map { !$0.isUnexpected } ?? true,
+            exitDescription: cause?.description ?? "exited",
+            ranJob: ranJobPerLog ?? (deletion == .alreadyGone),
+            uptime: registration.map { Date().timeIntervalSince($0.createdAt) } ?? 0
+        )
+
+        // Look again: it can be stopped while the registration was deleted.
+        reloadExternalConfigChanges()
+        guard let index = runners.firstIndex(where: { $0.id == id }),
+              runners[index].status == .running, !manualStopRequests.contains(id) else { return }
+
+        switch action {
+        case .stopped:
+            return
+        case .crash(let reason):
+            if !scheduleAutoRestart(for: id, reason: reason, runnerIndex: index) {
+                runners[index].status = .error
+            }
+            saveConfiguration()
+        case .startNext:
+            if let reason = pauseReasonBetweenJobs(for: runners[index]) {
+                pendingAutoPauses.removeValue(forKey: id)
+                runners[index].status = .paused
+                runners[index].autoPauseReason = reason
+                saveConfiguration()
+                logRunnerEvent(for: runners[index], message: "Paused for \(reason.displayName).")
+                return
+            }
+            do {
+                try await startRunner(id, holdingStartLock: true)
+            } catch RunnerError.alreadyRunning {
+                // Another Mac Runner process got there first.
+            } catch {
+                retryJITStart(id, after: error)
+            }
+        }
+    }
+
+    /// A JIT runner's next start failed (GitHub unreachable for a moment, say):
+    /// retry with the crash backoff instead of giving up at once, since unlike
+    /// a long-lived runner it needs the API before every job.
+    private func retryJITStart(_ id: UUID, after error: Error) {
+        guard let index = runners.firstIndex(where: { $0.id == id }) else { return }
+        let reason = "couldn't start the next single-use runner: \(error.localizedDescription)"
+        if !scheduleAutoRestart(for: id, reason: reason, runnerIndex: index) {
+            runners[index].status = .error
+        }
+        saveConfiguration()
+    }
+
+    /// Why a JIT runner whose job just ended should pause instead of taking
+    /// another: a pause waiting for that job, or one that applies now.
+    private func pauseReasonBetweenJobs(for runner: Runner) -> AutoPauseReason? {
+        if let pending = pendingAutoPauses[runner.id] { return pending }
+        guard automationEnabled,
+              let reason = AutoPausePolicy.reason(for: runner, settings: currentSettings, power: powerState, now: Date()),
+              runner.autoPauseOverride != reason else { return nil }
+        return reason
+    }
+
+    /// Whether runner.log shows `registration`'s run started a job; nil if it can't tell.
+    private func jitRunRanJob(_ runner: Runner, registration: JITRegistration) -> Bool? {
+        guard let path = logPath(for: runner, source: .output) else { return nil }
+        let lines = RunnerLogs.lastLines(of: path, count: 5000, maxBytes: 1024 * 1024)
+        return JITRunner.ranJob(in: lines, since: registration)
+    }
+
+    /// The menu bar app keeps every JIT runner going, whatever process started
+    /// it: one marked running whose process has exited with nobody watching (a
+    /// CLI started it and quit, say) gets its exit handled here, which deletes
+    /// the spent registration and starts the next one.
+    func superviseDetachedJITRunners() {
+        guard automationEnabled else { return }
+        reloadExternalConfigChanges()
+        for runner in runners where runner.isJIT && runner.status == .running {
+            let id = runner.id
+            guard runnerProcesses[id] == nil, runnerContainers[id] == nil,
+                  !startingRunnerIDs.contains(id), scheduledRestarts[id] == nil,
+                  !jitCyclingRunnerIDs.contains(id),
+                  !runnersToAutoRestart.contains(id), !autoRestartPendingIDs.contains(id),
+                  !processManager.isProcessAlive(for: id),
+                  !RunnerStartLock.isHeld(for: id) else { continue }
+            pidManager.removePID(for: id)
+            logRunnerEvent(for: runner, message: "Single-use runner \(runner.registeredName) exited with no Mac Runner process watching it; the app takes over.")
+            handleJITRunnerExit(id, cause: nil)
+        }
+    }
+
     // MARK: - Lookup
 
     /// Find a runner by name.
@@ -1713,6 +2167,9 @@ class RunnerManager: ObservableObject {
     private func reconcileRunnerStates() {
         var changed = false
         for i in runners.indices {
+            // A JIT runner exits after each job and stays wanted: the menu bar
+            // app starts its next registration (see superviseDetachedJITRunners).
+            if runners[i].isJIT { continue }
             if runners[i].status == .running && !processManager.isProcessAlive(for: runners[i].id) {
                 runners[i].status = .stopped
                 runners[i].busy = false
@@ -1759,7 +2216,7 @@ class RunnerManager: ObservableObject {
             // A Docker runner registers from inside its container and can outlive
             // the process that started it (a CLI, say): note its ID once it's online.
             var recordedRunnerIDs = false
-            for runner in runningRunners where runner.githubRunnerId == nil
+            for runner in runningRunners where runner.githubRunnerId == nil && !runner.isJIT
                 && runner.runsInDocker(global: currentSettings.isolationMode) {
                 if let match = remoteRunners.first(where: { $0.name == runner.name && $0.status == "online" }),
                    let index = runners.firstIndex(where: { $0.id == runner.id }) {
@@ -1776,7 +2233,7 @@ class RunnerManager: ObservableObject {
             // Runners whose log we follow get job changes from it (every job, immediately).
             for runner in runningRunners where jobLogTrackers[runner.id] == nil {
                 if let index = runners.firstIndex(where: { $0.id == runner.id }),
-                   let remoteRunner = remoteRunners.first(where: { $0.name == runner.name }) {
+                   let remoteRunner = remoteRunners.first(where: { $0.name == runner.registeredName }) {
                     if runners[index].busy != remoteRunner.busy {
                         let becameBusy = remoteRunner.busy
                         runners[index].busy = remoteRunner.busy
@@ -1947,7 +2404,10 @@ class RunnerManager: ObservableObject {
             containerImage: originalRunner.containerImage,
             containerEngine: originalRunner.containerEngine,
             containerCPUs: originalRunner.containerCPUs,
-            containerMemoryMB: originalRunner.containerMemoryMB
+            containerMemoryMB: originalRunner.containerMemoryMB,
+            jit: originalRunner.isJIT,
+            containerToolsOverride: originalRunner.containerToolsOverride,
+            containerCachePaths: originalRunner.containerCachePaths
         )
     }
 
@@ -1970,6 +2430,7 @@ class RunnerManager: ObservableObject {
     ///   - openFileLimit: Optional max open file override
     ///   - containerImage, containerEngine, containerCPUs, containerMemoryMB: Container
     ///     isolation settings, as for `addRunner`
+    ///   - jit: Single-use (JIT) registrations, as for `addRunner`
     ///   - onProgress: Called after each runner is created with (completed, total)
     /// - Throws: RunnerError if validation or setup fails for any runner
     func addRunners(
@@ -1985,6 +2446,7 @@ class RunnerManager: ObservableObject {
         containerEngine: ContainerEngine? = nil,
         containerCPUs: Int? = nil,
         containerMemoryMB: Int? = nil,
+        jit: Bool = false,
         onProgress: ((Int, Int) -> Void)? = nil
     ) async throws {
         guard count >= 1 else { return }
@@ -2002,7 +2464,8 @@ class RunnerManager: ObservableObject {
                 containerImage: containerImage,
                 containerEngine: containerEngine,
                 containerCPUs: containerCPUs,
-                containerMemoryMB: containerMemoryMB
+                containerMemoryMB: containerMemoryMB,
+                jit: jit
             )
             onProgress?(1, 1)
             return
@@ -2039,7 +2502,8 @@ class RunnerManager: ObservableObject {
                     containerImage: containerImage,
                     containerEngine: containerEngine,
                     containerCPUs: containerCPUs,
-                    containerMemoryMB: containerMemoryMB
+                    containerMemoryMB: containerMemoryMB,
+                    jit: jit
                 )
             } catch {
                 errors.append((name: name, error: error))
@@ -2116,10 +2580,17 @@ class RunnerManager: ObservableObject {
         let wasManualStop = manualStopRequests.remove(id) != nil
         activeWorkflowJobs.removeValue(forKey: id)
 
+        if let index = runners.firstIndex(where: { $0.id == id }), runners[index].isJIT, !wasManualStop {
+            // A single-use runner exits after its job: next registration, or backoff.
+            runners[index].busy = false
+            handleJITRunnerExit(id, cause: cause)
+            return
+        }
+
         if let index = runners.firstIndex(where: { $0.id == id }) {
             runners[index].busy = false
             if cause.isUnexpected && !wasManualStop {
-                if scheduleAutoRestart(for: id, cause: cause, runnerIndex: index) {
+                if scheduleAutoRestart(for: id, reason: cause.description, runnerIndex: index) {
                     saveConfiguration()
                     return
                 }
@@ -2134,11 +2605,11 @@ class RunnerManager: ObservableObject {
         }
     }
 
-    private func scheduleAutoRestart(for id: UUID, cause: RunnerTerminationCause, runnerIndex: Int) -> Bool {
+    private func scheduleAutoRestart(for id: UUID, reason: String, runnerIndex: Int) -> Bool {
         guard currentSettings.autoRestartEnabled else {
             scheduledRestarts[id]?.cancel()
             scheduledRestarts.removeValue(forKey: id)
-            runners[runnerIndex].lastRestartEvent = "Runner crashed (\(cause.description)); auto-restart disabled."
+            runners[runnerIndex].lastRestartEvent = "Runner crashed (\(reason)); auto-restart disabled."
             logRunnerEvent(for: runners[runnerIndex], message: runners[runnerIndex].lastRestartEvent ?? "")
             return false
         }
@@ -2149,7 +2620,7 @@ class RunnerManager: ObservableObject {
 
         guard attempts.count < maxRetries else {
             restartAttemptHistory[id] = attempts
-            runners[runnerIndex].lastRestartEvent = "Runner crashed (\(cause.description)); reached max retries (\(maxRetries)) in 10m."
+            runners[runnerIndex].lastRestartEvent = "Runner crashed (\(reason)); reached max retries (\(maxRetries)) in 10m."
             logRunnerEvent(for: runners[runnerIndex], message: runners[runnerIndex].lastRestartEvent ?? "")
             return false
         }
@@ -2160,7 +2631,7 @@ class RunnerManager: ObservableObject {
         let attemptNumber = attempts.count
         let delay = restartDelaySeconds(forAttempt: attemptNumber)
         runners[runnerIndex].status = .stopped
-        runners[runnerIndex].lastRestartEvent = "Runner crashed (\(cause.description)); restarting in \(delay)s (attempt \(attemptNumber)/\(maxRetries))."
+        runners[runnerIndex].lastRestartEvent = "Runner crashed (\(reason)); restarting in \(delay)s (attempt \(attemptNumber)/\(maxRetries))."
         logRunnerEvent(for: runners[runnerIndex], message: runners[runnerIndex].lastRestartEvent ?? "")
 
         scheduledRestarts[id]?.cancel()
@@ -2204,6 +2675,10 @@ class RunnerManager: ObservableObject {
                 logRunnerEvent(for: runners[refreshedIndex], message: runners[refreshedIndex].lastRestartEvent ?? "")
                 saveConfiguration()
             }
+        } catch RunnerError.alreadyRunning where runners.first(where: { $0.id == id })?.isJIT == true {
+            // Another Mac Runner process started it meanwhile.
+        } catch where runners.first(where: { $0.id == id })?.isJIT == true {
+            retryJITStart(id, after: error)
         } catch {
             if let refreshedIndex = runners.firstIndex(where: { $0.id == id }) {
                 runners[refreshedIndex].status = .error
@@ -2242,14 +2717,14 @@ class RunnerManager: ObservableObject {
         // Org-level runners would require scanning every repo in the org, which
         // we don't do here — leave the active job indicator empty.
         guard runner.scope == .repo else { return }
-        activeWorkflowJobs[runner.id] = try? await ghService.currentJob(for: runner.repo, runnerName: runner.name)
+        activeWorkflowJobs[runner.id] = try? await ghService.currentJob(for: runner.repo, runnerName: runner.registeredName)
     }
 
     private func handleJobStarted(for runner: Runner, notify: Bool = true, expectedName: String? = nil) async {
         guard activeWorkflowJobs[runner.id] == nil else { return }
         guard runner.scope == .repo else { return }
         let ghService = ghService
-        let repo = runner.repo, runnerName = runner.name
+        let repo = runner.repo, runnerName = runner.registeredName
         guard let job = await Self.withTimeout(seconds: 8, {
             try? await ghService.currentJob(for: repo, runnerName: runnerName)
         }) ?? nil else {
@@ -2402,7 +2877,7 @@ class RunnerManager: ObservableObject {
                 .completed(conclusion: conclusion)
             recordJob(job, for: runnerID, finishedAt: Date())
             if runner.scope == .repo {
-                linkLogOnlyJobLater(job, repo: runner.repo, runnerName: runner.name, runnerID: runnerID)
+                linkLogOnlyJobLater(job, repo: runner.repo, runnerName: runner.registeredName, runnerID: runnerID)
             }
             if currentSettings.notificationsEnabled {
                 await jobNotificationService.notify(event: .completed, runner: runner, job: job)
@@ -2565,7 +3040,7 @@ class RunnerManager: ObservableObject {
 
     private func runnerIsConfirmedIdle(_ runner: Runner) async -> Bool {
         guard let remoteRunners = try? await ghService.listRemoteRunners(for: runner.target),
-              let remoteRunner = remoteRunners.first(where: { $0.name == runner.name }) else {
+              let remoteRunner = remoteRunners.first(where: { $0.name == runner.registeredName }) else {
             return false
         }
 
@@ -2645,6 +3120,9 @@ enum RunnerError: LocalizedError {
     case dockerNotFound
     case dockerNotRunning
     case dockerHasTooFewCPUs(requested: Int, available: Int)
+    case startInProgress
+    case jitNeedsLabels
+    case cacheNeedsDocker
 
     var errorDescription: String? {
         switch self {
@@ -2665,6 +3143,12 @@ enum RunnerError: LocalizedError {
             return "Docker is not running. Start Docker Desktop (or OrbStack, Colima) and try again."
         case .dockerHasTooFewCPUs(let requested, let available):
             return "This runner asks for \(requested) CPUs, but Docker has \(available). Give Docker more CPUs (e.g. Docker Desktop → Settings → Resources) or lower the runner's CPUs."
+        case .startInProgress:
+            return "This runner is being started by another Mac Runner process."
+        case .jitNeedsLabels:
+            return "A JIT runner needs at least one label: GitHub gives it only the labels it's registered with."
+        case .cacheNeedsDocker:
+            return "Cache volumes need container isolation on the Docker engine (--isolation container --engine docker)."
         }
     }
 }

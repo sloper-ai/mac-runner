@@ -327,12 +327,20 @@ struct RunnerDetailView: View {
         return DetailSection(title: "Configuration") {
             DetailRow("Scope", runner.scope.displayName)
             DetailRow("Isolation", "\(isolation.icon) \(runner.isolationDisplayName(for: isolation))\(runner.isolationMode == nil ? " (global)" : "")")
+            if runner.isJIT {
+                DetailRow("Registration", runner.jitRegistration.map { "Single-use (JIT): \($0.name)" } ?? "Single-use (JIT), one per job")
+            }
             if isolation == .container {
                 DetailRow("Image", runner.containerImage ?? ContainerRunnerConfiguration.defaultRunnerImage)
-                DetailRow("Tools", (runner.containerTools ?? []).isEmpty ? "—" : (runner.containerTools ?? []).joined(separator: ", "))
+                DetailRow("Tools", runner.effectiveContainerTools.isEmpty
+                    ? (runner.containerToolsOverride == nil ? "—" : "None (installs nothing)")
+                    : runner.effectiveContainerTools.joined(separator: ", "))
                 DetailRow("Resources", runner.containerResourcesDescription)
                 if runner.effectiveContainerEngine == .docker {
-                    DetailRow("Work volume", DockerRunnerEngine.workVolumeName(for: runner.id))
+                    DetailRow("Work volume", DockerRunnerEngine.workVolumeName(for: runner.id) + (runner.isJIT ? " (emptied for each job)" : ""))
+                    if let cachePaths = runner.containerCachePaths, !cachePaths.isEmpty {
+                        DetailRow("Caches", cachePaths.joined(separator: ", "))
+                    }
                 }
             }
             DetailRow("Display", runner.enableGUI ? "GUI access" : "Headless")

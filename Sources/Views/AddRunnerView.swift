@@ -11,6 +11,7 @@ struct AddRunnerView: View {
     @State private var labelsText = "macos, mac-runner"
     @State private var selectedIsolation: IsolationSelection = .global
     @State private var enableGUI = false
+    @State private var jit = false
     @State private var openFileLimitText = ""
     @State private var containerImage = ""
     @State private var containerEngine: ContainerEngine = .apple
@@ -221,6 +222,19 @@ struct AddRunnerView: View {
                                 Text(selectedIsolation == .container
                                     ? "Give this runner its own virtual display (Xvfb) inside its \(containerEngine == .docker ? "container" : "VM") (default: headless)"
                                     : "Allow runner to access display (default: headless)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+
+                    // Single-use (JIT) registrations
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle(isOn: $jit) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Single-Use Runners (JIT)")
+                                    .font(.subheadline)
+                                Text("Register a new runner with a fresh workspace for each job, and delete it afterwards. It gets only the labels above, so include self-hosted and the OS if workflows ask for them.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -533,6 +547,7 @@ struct AddRunnerView: View {
                 containerImage: selectedIsolation == .container ? containerImage : nil,
                 // Apple's engine is stored as nil, as before engines existed.
                 containerEngine: selectedIsolation == .container && containerEngine == .docker ? .docker : nil,
+                jit: jit,
                 onProgress: { current, total in
                     addingProgress = (current: current, total: total)
                 }

@@ -16,7 +16,7 @@ final class DockerRunnerEngineTests: XCTestCase {
     private func variables(name: String = "linux 1") -> [(name: String, value: String)] {
         ContainerRunnerScript.variables(
             registrationURL: "https://github.com/o/r",
-            registrationToken: secret,
+            registration: .token(secret),
             runnerName: name,
             labels: ["linux", "mac-runner"],
             runnerDownloadURL: RunnerInstaller.linuxDownloadURL(version: "2.337.0"),
@@ -34,7 +34,7 @@ final class DockerRunnerEngineTests: XCTestCase {
     func testBothEnginesGiveTheScriptTheSameInputs() {
         let shared = ContainerRunnerScript.variables(
             registrationURL: "https://github.com/o/r",
-            registrationToken: "t",
+            registration: .token("t"),
             runnerName: "n",
             labels: ["linux"],
             runnerDownloadURL: "https://example.com/runner.tar.gz",
@@ -310,6 +310,77 @@ final class DockerRunnerEngineTests: XCTestCase {
         )
         let volume = try ProcessExecutor.run(docker, arguments: ["volume", "inspect", DockerRunnerEngine.workVolumeName(for: id)], timeout: 30)
         XCTAssertEqual(volume?.succeeded, true, "the work directory is a volume that outlives the container")
+    }
+
+    /// Two starts of a JIT runner against real Docker, with a stand-in startup
+    /// script: each gets an empty work volume, a cache volume keeps what the
+    /// first left, and the JIT config arrives through the environment. Opt in
+    /// with MAC_RUNNER_DOCKER_TESTS=1 (image as for the test above).
+    func testJITStartsGetAFreshWorkVolumeAndKeepTheirCaches() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["MAC_RUNNER_DOCKER_TESTS"] == "1" else {
+            throw XCTSkip("Set MAC_RUNNER_DOCKER_TESTS=1 to run against Docker")
+        }
+        guard let docker = DockerRunnerEngine.executablePath() else {
+            throw XCTSkip("Docker isn't installed")
+        }
+
+        let id = UUID()
+        let cachePath = "/var/cache/mac-runner-test"
+        let cacheVolume = DockerRunnerEngine.cacheVolumeName(for: id, path: cachePath)
+        let root = try makeScratchDirectory()
+        let runnerDirectory = root.appendingPathComponent("runner dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: runnerDirectory.appendingPathComponent("_diag"), withIntermediateDirectories: true)
+        defer {
+            _ = try? ProcessExecutor.run(docker, arguments: ["rm", "-f", DockerRunnerEngine.containerName(for: id)], timeout: 30)
+            _ = try? ProcessExecutor.run(docker, arguments: ["volume", "rm", DockerRunnerEngine.workVolumeName(for: id), cacheVolume], timeout: 30)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        func start() throws -> String {
+            // As startRunner does at every start: write the launch files, then run the launcher.
+            let launcher = try DockerRunnerEngine.writeLaunchFiles(
+                docker: docker,
+                runnerID: id,
+                runnerName: "jit test",
+                runnerDirectory: runnerDirectory.path,
+                image: environment["MAC_RUNNER_DOCKER_TEST_IMAGE"] ?? "ubuntu:24.04",
+                cpus: 1,
+                memoryMB: 1024,
+                openFileLimit: 4096,
+                environmentNames: [JITRunner.configVariable],
+                resetWorkVolume: true,
+                cacheMounts: DockerRunnerEngine.cacheMounts(for: id, paths: [cachePath])
+            )
+            try """
+            set -euo pipefail
+            if [ "$(id -u)" -ne 0 ]; then SUDO=sudo; else SUDO=""; fi
+            for dir in /mac-runner/_work /mac-runner/_diag \(cachePath); do
+              [ -w "$dir" ] || $SUDO chown "$(id -u):$(id -g)" "$dir"
+            done
+            echo "jit=${\(JITRunner.configVariable):-unset}"
+            echo "work=[$(ls -A /mac-runner/_work | tr '\\n' ' ')]"
+            echo "cache=$(cat \(cachePath)/marker 2>/dev/null || echo none)"
+            touch /mac-runner/_work/left-by-the-last-job
+            echo kept > \(cachePath)/marker
+            """.write(to: runnerDirectory.appendingPathComponent("container-runner.sh"), atomically: true, encoding: .utf8)
+
+            var launchEnvironment = RunnerEnvironment.environment(enableGUI: false)
+            launchEnvironment[JITRunner.configVariable] = "jit 'config' $value"
+            let result = try runLauncher(launcher, environment: launchEnvironment)
+            XCTAssertEqual(result.status, 0, result.output)
+            XCTAssertFalse(try String(contentsOfFile: launcher, encoding: .utf8).contains("jit 'config'"))
+            return result.output
+        }
+
+        let first = try start()
+        XCTAssertTrue(first.contains("jit=jit 'config' $value"), first)
+        XCTAssertTrue(first.contains("work=[]"), first)
+        XCTAssertTrue(first.contains("cache=none"), first)
+
+        let second = try start()
+        XCTAssertTrue(second.contains("work=[]"), "the next job's workspace starts empty: \(second)")
+        XCTAssertTrue(second.contains("cache=kept"), "the cache volume outlives the container: \(second)")
     }
 
     private func runLauncher(_ launcher: String, environment: [String: String]) throws -> (status: Int32, output: String) {

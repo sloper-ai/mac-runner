@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Runs container runners in Docker instead of Apple's Containerization.
@@ -34,13 +35,74 @@ enum DockerRunnerEngine {
         "mac-runner-\(id.uuidString)-work"
     }
 
+    // MARK: - Cache Volumes
+
+    /// Every cache volume of the runner starts with this.
+    static func cacheVolumePrefix(for id: UUID) -> String {
+        "mac-runner-\(id.uuidString)-cache-"
+    }
+
+    /// The volume behind a cache path: `mac-runner-<id>-cache-<8 hex of its SHA-256>`.
+    static func cacheVolumeName(for id: UUID, path: String) -> String {
+        let digest = SHA256.hash(data: Data(normalizedCachePath(path).utf8))
+        return cacheVolumePrefix(for: id) + digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The runner's cache volumes and where each is mounted, in the order given.
+    static func cacheMounts(for id: UUID, paths: [String]) -> [(volume: String, path: String)] {
+        paths.map { (cacheVolumeName(for: id, path: $0), normalizedCachePath($0)) }
+    }
+
+    /// A container path with repeated and trailing slashes removed.
+    static func normalizedCachePath(_ path: String) -> String {
+        "/" + path.split(separator: "/", omittingEmptySubsequences: true).joined(separator: "/")
+    }
+
+    /// Container paths to back with cache volumes, normalized and without
+    /// duplicates; or why one can't be: each must be absolute, not `/`, outside
+    /// the runner's own mounts (`/mac-runner`), free of `.`/`..` parts, and free
+    /// of `:` and `,` (which `docker run -v` would split on).
+    static func cachePaths(_ raw: [String]) -> Result<[String], CLIParseError> {
+        var paths: [String] = []
+        for entry in raw {
+            let path = entry.trimmingCharacters(in: .whitespaces)
+            guard path.hasPrefix("/") else {
+                return .failure(.message("cache path '\(entry)' must be an absolute path in the container"))
+            }
+            guard !path.contains(":"), !path.contains(","), !path.contains(where: { $0.isNewline || $0 == "\0" }) else {
+                return .failure(.message("cache path '\(entry)' can't contain ':' or ','"))
+            }
+            let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+            guard !parts.isEmpty else {
+                return .failure(.message("cache path '\(entry)' can't be the container's root"))
+            }
+            guard !parts.contains(where: { $0 == "." || $0 == ".." }) else {
+                return .failure(.message("cache path '\(entry)' can't contain '.' or '..'"))
+            }
+            let normalized = normalizedCachePath(path)
+            guard normalized != "/mac-runner", !normalized.hasPrefix("/mac-runner/") else {
+                return .failure(.message("cache path '\(entry)' is inside /mac-runner, where Mac Runner mounts the runner's own directories"))
+            }
+            if !paths.contains(normalized) {
+                paths.append(normalized)
+            }
+        }
+        return .success(paths)
+    }
+
     // MARK: - Launcher
 
     /// The launcher. It frees the runner's container name (a crash can leave
     /// the previous container behind), then execs `docker run` in the
     /// foreground. The startup script's variables are passed by name only
-    /// (`-e NAME`): their values, the registration token among them, come from
-    /// the environment the launcher is started with and are never written here.
+    /// (`-e NAME`): their values, the registration token or a JIT config among
+    /// them, come from the environment the launcher is started with and are
+    /// never written here.
+    /// - Parameters:
+    ///   - resetWorkVolume: Delete the work volume first, so the container starts
+    ///     with an empty one (JIT runners: a fresh workspace for every job). The
+    ///     launch fails if it can't be deleted.
+    ///   - cacheMounts: Volumes mounted at these container paths, kept across containers.
     static func launcherScript(
         docker: String,
         runnerID: UUID,
@@ -50,15 +112,19 @@ enum DockerRunnerEngine {
         cpus: Int,
         memoryMB: Int,
         openFileLimit: Int,
-        environmentNames: [String]
+        environmentNames: [String],
+        resetWorkVolume: Bool = false,
+        cacheMounts: [(volume: String, path: String)] = []
     ) -> String {
         let container = containerName(for: runnerID)
+        let workVolume = workVolumeName(for: runnerID)
         let lines: [[String]] = [
             [docker, "run", "--rm", "--init"],
             ["--name", container],
             ["--hostname", ContainerRunnerScript.hostname(for: runnerName)],
             ["--label", "\(runnerIDLabel)=\(runnerID.uuidString)"],
-            ["-v", "\(workVolumeName(for: runnerID)):\(ContainerRunnerScript.workMount)"],
+            ["-v", "\(workVolume):\(ContainerRunnerScript.workMount)"],
+            cacheMounts.flatMap { ["-v", "\($0.volume):\($0.path)"] },
             ["-v", "\(runnerDirectory)/_diag:\(ContainerRunnerScript.diagnosticsMount)"],
             ["-v", "\(runnerDirectory)/\(scriptFileName):\(scriptMount):ro"],
             ["--cpus", "\(cpus)", "--memory", "\(memoryMB)m"],
@@ -72,6 +138,15 @@ enum DockerRunnerEngine {
             .map { $0.map(shellQuoted).joined(separator: " ") }
             .joined(separator: " \\\n  ")
         let dockerDirectory = (docker as NSString).deletingLastPathComponent
+        // After the container is gone; `volume rm -f` succeeds when there's no volume.
+        let reset = resetWorkVolume ? """
+        # A fresh workspace for every job: an empty work volume.
+        if ! \(shellQuoted(docker)) volume rm -f \(shellQuoted(workVolume)) >/dev/null; then
+          echo "[mac-runner] ERROR: could not delete the work volume \(workVolume) to give this job a fresh workspace; not starting the runner." >&2
+          exit 1
+        fi
+
+        """ : ""
 
         return """
         #!/bin/bash
@@ -80,7 +155,7 @@ enum DockerRunnerEngine {
         # docker finds its credential helpers next to itself.
         export PATH=\(shellQuoted(dockerDirectory)):"$PATH"
         \(shellQuoted(docker)) rm -f \(shellQuoted(container)) >/dev/null 2>&1 || true
-        exec \(command)
+        \(reset)exec \(command)
 
         """
     }
@@ -97,7 +172,9 @@ enum DockerRunnerEngine {
         cpus: Int,
         memoryMB: Int,
         openFileLimit: Int,
-        environmentNames: [String]
+        environmentNames: [String],
+        resetWorkVolume: Bool = false,
+        cacheMounts: [(volume: String, path: String)] = []
     ) throws -> String {
         let directory = URL(fileURLWithPath: runnerDirectory, isDirectory: true)
 
@@ -115,7 +192,9 @@ enum DockerRunnerEngine {
             cpus: cpus,
             memoryMB: memoryMB,
             openFileLimit: openFileLimit,
-            environmentNames: environmentNames
+            environmentNames: environmentNames,
+            resetWorkVolume: resetWorkVolume,
+            cacheMounts: cacheMounts
         )
         try contents.write(to: launcher, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: launcher.path)
@@ -225,5 +304,43 @@ enum DockerRunnerEngine {
         guard let docker = executablePath() else { return false }
         _ = await run(docker, ["rm", "-f", containerName(for: id)])
         return await run(docker, ["volume", "rm", workVolumeName(for: id)])?.succeeded ?? false
+    }
+
+    /// Remove the runner's container, its work volume, and all its cache
+    /// volumes, including ones for paths it no longer lists (errors ignored).
+    /// Returns how many volumes were removed.
+    @discardableResult
+    static func removeContainerAndVolumes(for id: UUID) async -> Int {
+        guard let docker = executablePath() else { return 0 }
+        let removedWork = await removeContainerAndWorkVolume(for: id)
+        let removedCaches = await removeCacheVolumes(for: id, docker: docker)
+        return (removedWork ? 1 : 0) + removedCaches
+    }
+
+    /// Remove the runner's cache volumes except those for `keeping` (errors
+    /// ignored; one a container still uses stays). Returns how many went.
+    @discardableResult
+    static func removeCacheVolumes(for id: UUID, keeping paths: [String] = [], docker: String? = nil) async -> Int {
+        guard let docker = docker ?? executablePath(),
+              let listed = await run(docker, ["volume", "ls", "-q", "--filter", "name=\(cacheVolumePrefix(for: id))"]),
+              listed.succeeded else { return 0 }
+        let kept = Set(paths.map { cacheVolumeName(for: id, path: $0) })
+        let stale = cacheVolumes(for: id, in: listed.output).filter { !kept.contains($0) }
+        var removed = 0
+        for volume in stale {
+            if await run(docker, ["volume", "rm", volume])?.succeeded == true {
+                removed += 1
+            }
+        }
+        return removed
+    }
+
+    /// The runner's cache volumes among `docker volume ls -q` output (whose
+    /// name filter matches anywhere in a name, not just its start).
+    static func cacheVolumes(for id: UUID, in output: String) -> [String] {
+        let prefix = cacheVolumePrefix(for: id)
+        return output.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.hasPrefix(prefix) }
     }
 }

@@ -145,11 +145,37 @@ enum ContainerRunnerScript {
       ln -s "$MR_DIAG_DIR" "$RUNNER_HOME/_diag"
     fi
 
+    # Cache volumes outlive the container. Docker creates a mount point (and any
+    # missing parent) owned by root: make them this user's, parents within $HOME too.
+    if [ -n "${MR_CACHE_DIRS:-}" ]; then
+      IFS=: read -r -a cache_dirs <<< "$MR_CACHE_DIRS"
+      for dir in "${cache_dirs[@]}"; do
+        [ -n "$dir" ] || continue
+        if ! ensure_dir "$dir" || [ ! -w "$dir" ]; then
+          log "ERROR: the cache $dir isn't writable by $(id -un), and sudo couldn't fix that."
+          exit 1
+        fi
+        parent="$(dirname "$dir")"
+        while [ -n "${HOME:-}" ] && [ "$parent" != "$HOME" ] && [ "${parent#"$HOME"/}" != "$parent" ]; do
+          [ -w "$parent" ] || $SUDO chown "$(id -u):$(id -g)" "$parent" 2>/dev/null \
+            || log "Warning: $parent isn't writable by $(id -un)"
+          parent="$(dirname "$parent")"
+        done
+      done
+    fi
+
     cd "$RUNNER_HOME"
-    ./config.sh --unattended --replace \
-      --url "$MR_URL" --token "$MR_TOKEN" \
-      --name "$MR_NAME" --labels "$MR_LABELS" --work "$MR_WORK_DIR"
-    unset MR_TOKEN
+    if [ -n "${ACTIONS_RUNNER_INPUT_JITCONFIG:-}" ]; then
+      # Single-use runner: it registers itself from the JIT config in its
+      # environment (the runner reads ACTIONS_RUNNER_INPUT_JITCONFIG like
+      # --jitconfig), so there's no config.sh.
+      log "Starting a single-use (JIT) runner"
+    else
+      ./config.sh --unattended --replace \
+        --url "$MR_URL" --token "$MR_TOKEN" \
+        --name "$MR_NAME" --labels "$MR_LABELS" --work "$MR_WORK_DIR"
+      unset MR_TOKEN
+    fi
     ulimit -n "$MR_OPEN_FILES" 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
     exec ./run.sh
     """#
@@ -187,23 +213,41 @@ enum ContainerRunnerScript {
         return (packages.filter { seen.insert($0).inserted }, installGitHubCLI)
     }
 
+    /// How the runner in the container registers.
+    enum Registration: Equatable {
+        /// With `config.sh` and a registration token (`MR_TOKEN`), as a long-lived runner.
+        case token(String)
+        /// As a single-use runner, from a JIT config in `ACTIONS_RUNNER_INPUT_JITCONFIG`
+        /// (the runner reads it like `--jitconfig`); `config.sh` is skipped.
+        case jitConfig(String)
+
+        var variable: (name: String, value: String) {
+            switch self {
+            case .token(let token): return ("MR_TOKEN", token)
+            case .jitConfig(let config): return (JITRunner.configVariable, config)
+            }
+        }
+    }
+
     /// The script's inputs, in a fixed order: the container environment both
     /// engines give it. Values are passed as they are, never through a shell.
+    /// `cacheDirectories` (Docker cache volumes) are only listed when there are some.
     static func variables(
         registrationURL: String,
-        registrationToken: String,
+        registration: Registration,
         runnerName: String,
         labels: [String],
         runnerDownloadURL: String,
         openFileLimit: Int,
         tools: [String],
-        enableGUI: Bool
+        enableGUI: Bool,
+        cacheDirectories: [String] = []
     ) -> [(name: String, value: String)] {
         let apt = aptPackages(for: tools)
-        return [
+        var variables = [
             ("RUNNER_ALLOW_RUNASROOT", "1"),
             ("MR_URL", registrationURL),
-            ("MR_TOKEN", registrationToken),
+            registration.variable,
             ("MR_NAME", runnerName),
             ("MR_LABELS", labels.joined(separator: ",")),
             ("MR_RUNNER_URL", runnerDownloadURL),
@@ -215,12 +259,17 @@ enum ContainerRunnerScript {
             ("MR_ENABLE_GUI", enableGUI ? "1" : "0"),
             ("MR_DISPLAY", displayName),
         ]
+        if !cacheDirectories.isEmpty {
+            // Cache paths can't contain ':' (see DockerRunnerEngine.cachePaths).
+            variables.append(("MR_CACHE_DIRS", cacheDirectories.joined(separator: ":")))
+        }
+        return variables
     }
 
     static func environment(for config: ContainerRunnerConfiguration) -> [String] {
         variables(
             registrationURL: config.repositoryURL,
-            registrationToken: config.registrationToken,
+            registration: config.jitConfig.map(Registration.jitConfig) ?? .token(config.registrationToken),
             runnerName: config.runnerName,
             labels: config.labels,
             runnerDownloadURL: config.runnerDownloadURL,

@@ -13,6 +13,12 @@ struct AddCommand: Equatable {
     var engine: ContainerEngine?
     var cpus: Int?
     var memoryMB: Int?
+    /// Register a single-use runner for each job.
+    var jit = false
+    /// Install no tools when the container starts.
+    var noTools = false
+    /// Container paths kept in Docker cache volumes, normalized.
+    var cachePaths: [String] = []
 
     /// Parses the target and its options. Options it doesn't know are skipped.
     static func parse(
@@ -89,6 +95,21 @@ struct AddCommand: Equatable {
                 }
                 command.openFileLimit = parsed
                 i += 2
+            case "--jit":
+                command.jit = true
+                i += 1
+            case "--no-tools":
+                command.noTools = true
+                i += 1
+            case "--cache":
+                guard i + 1 < args.count else {
+                    return .failure(.message("--cache requires a container path"))
+                }
+                switch DockerRunnerEngine.cachePaths(command.cachePaths + [args[i + 1]]) {
+                case .success(let paths): command.cachePaths = paths
+                case .failure(let error): return .failure(.message("--cache: \(error.text)"))
+                }
+                i += 2
             default:
                 i += 1
             }
@@ -109,12 +130,29 @@ struct AddCommand: Equatable {
     }
 
     /// Container options are only valid for a runner that will use container
-    /// isolation, its own or the global mode.
+    /// isolation, its own or the global mode; cache volumes need Docker; and a
+    /// JIT runner needs a label, since it gets only the labels it's given.
     func validationError(globalIsolation: IsolationMode) -> CLIParseError? {
-        guard (isolationMode ?? globalIsolation) != .container else { return nil }
-        let containerOptions = [("--image", image != nil), ("--engine", engine != nil), ("--cpus", cpus != nil), ("--memory", memoryMB != nil)]
-        guard let option = containerOptions.first(where: { $0.1 })?.0 else { return nil }
-        return .message("\(option) only applies to container isolation (--isolation container)")
+        if jit, labels?.isEmpty == true {
+            return .message("--jit needs at least one label: GitHub gives a JIT runner only the labels it's registered with")
+        }
+        guard (isolationMode ?? globalIsolation) == .container else {
+            let containerOptions = [
+                ("--image", image != nil), ("--engine", engine != nil), ("--cpus", cpus != nil), ("--memory", memoryMB != nil),
+                ("--no-tools", noTools), ("--cache", !cachePaths.isEmpty),
+            ]
+            guard let option = containerOptions.first(where: { $0.1 })?.0 else { return nil }
+            return .message("\(option) only applies to container isolation (--isolation container)")
+        }
+        if !cachePaths.isEmpty && engine != .docker {
+            return .message("--cache needs the Docker engine (--engine docker)")
+        }
+        return nil
+    }
+
+    /// The tools to install at each container start instead of detected ones: none with --no-tools.
+    var containerToolsOverride: [String]? {
+        noTools ? [] : nil
     }
 }
 
@@ -233,7 +271,7 @@ enum BatteryCommand: Equatable {
     }
 }
 
-enum CLIParseError: Error, Equatable {
+enum CLIParseError: LocalizedError, Equatable {
     case message(String)
 
     var text: String {
@@ -241,6 +279,8 @@ enum CLIParseError: Error, Equatable {
         case .message(let text): return text
         }
     }
+
+    var errorDescription: String? { text }
 }
 
 /// Parsed `mac-runner logs` arguments.

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum CLIHandler {
@@ -162,6 +163,9 @@ enum CLIHandler {
           --engine <engine>    Container engine for --isolation container: apple|docker (default: apple)
           --cpus <n>           CPUs for --isolation container (default: 2)
           --memory <size>      Memory for --isolation container: 8g, 8192m, or MB (default: 4g)
+          --jit                Single-use runners: register a new one, with a fresh workspace, for each job
+          --no-tools           Container isolation: install no tools when the container starts
+          --cache <path>       Docker engine: keep this container path in a volume across jobs (repeatable)
 
         SETUP OPTIONS:
           --teardown        Remove isolation (delete user, sudoers, reset config)
@@ -207,6 +211,9 @@ enum CLIHandler {
           mac-runner add owner/repo --isolation container
           mac-runner add owner/repo --isolation container --image ghcr.io/myorg/runner:latest
           mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --cpus 4 --memory 8g
+          mac-runner add owner/repo --isolation container --engine docker --image my-ci-image:latest --jit --no-tools \\
+            --labels self-hosted,linux,arm64 --cache /home/runner/.cargo/registry
+          mac-runner add owner/repo --isolation user --jit --labels self-hosted,macos,arm64
           mac-runner add owner/repo --isolation user
           mac-runner add owner/repo --enable-gui
           mac-runner list
@@ -271,9 +278,9 @@ enum CLIHandler {
         }
     }
 
-    /// A runner's isolation for `list`, e.g. "📦 Container (Docker) · 4 CPUs, 8 GB":
+    /// A runner's isolation for `list`, e.g. "📦 Container (Docker) · 4 CPUs, 8 GB · JIT":
     /// container runners show their engine when it's Docker, and their CPUs and
-    /// memory when those aren't the defaults.
+    /// memory when those aren't the defaults; single-use runners say JIT.
     static func isolationText(for runner: Runner, global globalMode: IsolationMode) -> String {
         let effective = runner.effectiveIsolationMode(global: globalMode)
         var text = "\(effective.icon) \(runner.isolationDisplayName(for: effective))"
@@ -283,6 +290,9 @@ enum CLIHandler {
         if effective == .container, let resources = runner.containerResourcesSummary {
             text += " · \(resources)"
         }
+        if runner.isJIT {
+            text += " · JIT"
+        }
         return text
     }
 
@@ -290,8 +300,8 @@ enum CLIHandler {
     private static func handleAdd(args: [String]) async {
         guard !args.isEmpty else {
             print("Error: repository or organization required")
-            print("Usage: mac-runner add <owner/repo> [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>]")
-            print("       mac-runner add <org> --org [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>]")
+            print("Usage: mac-runner add <owner/repo> [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>] [--jit]")
+            print("       mac-runner add <org> --org [--name <name>] [--labels <l1,l2>] [--isolation <mode>] [--enable-gui] [--open-files <limit>] [--jit]")
             return
         }
 
@@ -337,7 +347,10 @@ enum CLIHandler {
                 containerImage: command.image,
                 containerEngine: command.engine,
                 containerCPUs: command.cpus,
-                containerMemoryMB: command.memoryMB
+                containerMemoryMB: command.memoryMB,
+                jit: command.jit,
+                containerToolsOverride: command.containerToolsOverride,
+                containerCachePaths: command.cachePaths.isEmpty ? nil : command.cachePaths
             )
             let added = manager.runner(named: name)
             var message = "Runner '\(name)' added"
@@ -349,12 +362,20 @@ enum CLIHandler {
             if let resources = added?.containerResourcesSummary {
                 message += " (\(resources))"
             }
+            if command.jit {
+                message += " as a single-use (JIT) runner"
+            }
             message += enableGUI ? " with GUI access" : " (headless)"
             if let openFileLimit {
                 message += " and open file limit \(openFileLimit)"
             }
             message += " and started successfully!"
             print(message)
+            if let added, added.isJIT {
+                for note in jitNotes(for: added, appIsRunning: menuBarAppIsRunning()) {
+                    print(note)
+                }
+            }
             await hostContainerRunnersInForeground(manager: manager)
         } catch {
             print("Error: \(error.localizedDescription)")
@@ -455,6 +476,11 @@ enum CLIHandler {
         do {
             try await manager.startRunner(runner.id)
             print("Runner '\(name)' started.")
+            if let started = manager.runner(named: name), started.isJIT {
+                for note in jitNotes(for: started, appIsRunning: menuBarAppIsRunning()) {
+                    print(note)
+                }
+            }
             await hostContainerRunnersInForeground(manager: manager)
         } catch {
             print("Error: \(error.localizedDescription)")
@@ -531,6 +557,13 @@ enum CLIHandler {
                 print("    \(line)")
             }
         }
+        let jitLines = jitStatusLines(runners: runners)
+        if !jitLines.isEmpty {
+            print("  JIT runners (single-use, one registration per job):")
+            for line in jitLines {
+                print("    \(line)")
+            }
+        }
         if runners.contains(where: { $0.runsInDocker(global: globalMode) }) {
             let docker = DockerRunnerEngine.executablePath()
             let state: String
@@ -553,6 +586,38 @@ enum CLIHandler {
             guard runner.effectiveContainerEngine == .docker || resources != nil else { return nil }
             return "\(runner.name): \(runner.isolationDisplayName(for: isolation))" + (resources.map { " · \($0)" } ?? "")
         }
+    }
+
+    /// `status` lines for JIT runners, e.g. "linux-1: JIT, registered as linux-1-3fa29c (GitHub ID 42)".
+    static func jitStatusLines(runners: [Runner]) -> [String] {
+        runners.filter(\.isJIT).sorted { $0.name < $1.name }.map { runner in
+            let state: String
+            if let registration = runner.jitRegistration {
+                state = "registered as \(registration.name) (GitHub ID \(registration.id))"
+            } else {
+                state = runner.status == .running ? "between jobs, registering the next" : "not registered (\(runner.status.rawValue))"
+            }
+            return "\(runner.name): JIT, \(state)"
+        }
+    }
+
+    /// What to tell someone who just started a JIT runner from the CLI.
+    static func jitNotes(for runner: Runner, appIsRunning: Bool) -> [String] {
+        var notes: [String] = []
+        let wanted = ["self-hosted"]
+        if !runner.labels.contains(where: { wanted.contains($0.lowercased()) }) {
+            notes.append("Note: a JIT runner gets only the labels it's registered with (\(runner.labels.joined(separator: ","))); add self-hosted, the OS, and the architecture to --labels if your workflows ask for them.")
+        }
+        if !appIsRunning {
+            notes.append("Note: this JIT runner exits after its job, and the Mac Runner menu bar app registers and starts the next one. It isn't running: open it (open -a MacRunner) to keep this runner taking jobs.")
+        }
+        return notes
+    }
+
+    /// Whether the Mac Runner menu bar app is running (it supervises JIT runners).
+    static func menuBarAppIsRunning() -> Bool {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.omniaura.mac-runner")
+            .contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && !$0.isTerminated }
     }
 
     /// `mac-runner status --resources` output.
@@ -693,6 +758,9 @@ enum CLIHandler {
         }
         print(failures == 0 ? "Applied \(changes.count) change(s)." : "\(failures) of \(changes.count) change(s) failed.")
         if failures > 0 { exitCode = 1 }
+        if manager.runners.contains(where: { $0.isJIT && $0.status == .running }), !menuBarAppIsRunning() {
+            print("Note: JIT runners exit after each job, and the Mac Runner menu bar app registers and starts the next one. It isn't running: open it (open -a MacRunner) to keep them taking jobs.")
+        }
         await hostContainerRunnersInForeground(manager: manager)
     }
 
@@ -882,10 +950,13 @@ enum CLIHandler {
             globalIsolationMode: config.settings.isolationMode,
             includeApplication: includeApplication
         )
-        // A Docker runner's work directory is a volume, not a file.
+        // A Docker runner's work directory and caches are volumes, not files.
         let dockerVolumes = config.runners
             .filter { $0.runsInDocker(global: config.settings.isolationMode) }
-            .map { DockerRunnerEngine.workVolumeName(for: $0.id) }
+            .flatMap { runner in
+                [DockerRunnerEngine.workVolumeName(for: runner.id)]
+                    + DockerRunnerEngine.cacheMounts(for: runner.id, paths: runner.containerCachePaths ?? []).map(\.volume)
+            }
 
         guard !plan.isEmpty || !dockerVolumes.isEmpty else {
             print("Nothing to uninstall - no Mac Runner files found.")
@@ -933,20 +1004,26 @@ enum CLIHandler {
             for runner in plan.runnersToDeregister {
                 guard let ghId = runner.githubRunnerId else { continue }
                 do {
-                    try await GHCLIService.shared.deleteRunner(target: runner.target, githubRunnerId: ghId)
+                    // Already gone counts: stopping a JIT runner above deleted its registration.
+                    try await GHCLIService.shared.deleteRunnerIfPresent(target: runner.target, githubRunnerId: ghId)
                     deregistered.append(runner.name)
                 } catch {
                     failedDeregistrations.append("\(runner.name) (\(runner.repo))")
                 }
             }
+            // Offline registrations left by JIT runners' earlier starts.
+            for runner in config.runners where runner.isJIT {
+                guard let remote = try? await GHCLIService.shared.listRemoteRunners(for: runner.target) else { continue }
+                for leftover in JITRunner.leftoverRegistrations(of: runner.name, in: remote) {
+                    _ = try? await GHCLIService.shared.deleteRunnerIfPresent(target: runner.target, githubRunnerId: leftover.id)
+                }
+            }
         }
 
-        // Containers and work volumes, for any container runner that ever used Docker.
+        // Containers, work and cache volumes, for any container runner that ever used Docker.
         var removedVolumes = 0
         for runner in config.runners where runner.effectiveIsolationMode(global: config.settings.isolationMode) == .container {
-            if await DockerRunnerEngine.removeContainerAndWorkVolume(for: runner.id) {
-                removedVolumes += 1
-            }
+            removedVolumes += await DockerRunnerEngine.removeContainerAndVolumes(for: runner.id)
         }
 
         let report = service.execute(
@@ -994,7 +1071,7 @@ enum CLIHandler {
 
         if !dockerVolumes.isEmpty {
             print("")
-            print("Will remove Docker volumes (runner work directories):")
+            print("Will remove Docker volumes (runner work directories and caches):")
             for volume in dockerVolumes {
                 print("  \(volume)")
             }

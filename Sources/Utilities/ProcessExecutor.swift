@@ -51,6 +51,35 @@ enum ProcessExecutor {
         return ProcessResult(terminationStatus: process.terminationStatus, output: output)
     }
 
+    /// Execute a process with `input` on its stdin (a secret, say, which then
+    /// never appears in its arguments), capturing its combined output.
+    static func run(_ executable: String, arguments: [String], input: Data) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let stdin = Pipe()
+        let output = Pipe()
+        process.standardInput = stdin
+        process.standardOutput = output
+        process.standardError = output
+
+        try process.run()
+        // Feed stdin from another thread so neither pipe can fill up and stall the other.
+        let writer = stdin.fileHandleForWriting
+        // If the process exits without reading, fail the write instead of raising SIGPIPE.
+        _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+        let written = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? writer.write(contentsOf: input)
+            try? writer.close()
+            written.signal()
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        written.wait()
+        return ProcessResult(terminationStatus: process.terminationStatus, output: data.asUTF8String)
+    }
+
     /// Execute a process, capturing output, and terminate it if it runs longer
     /// than `timeout`. Returns nil on timeout.
     static func run(_ executable: String, arguments: [String], timeout: TimeInterval) throws -> ProcessResult? {

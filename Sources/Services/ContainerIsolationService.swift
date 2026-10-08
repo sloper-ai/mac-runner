@@ -417,6 +417,10 @@ struct ContainerRunnerConfiguration {
     /// Registration token for the runner.
     var registrationToken: String
 
+    /// A single-use runner's JIT config, used instead of the token: the runner
+    /// reads it from its environment and `config.sh` is skipped.
+    var jitConfig: String? = nil
+
     /// Name and labels the runner registers with.
     var runnerName: String
     var labels: [String]

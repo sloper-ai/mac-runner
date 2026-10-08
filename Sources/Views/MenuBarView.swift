@@ -403,6 +403,18 @@ struct RunnerRow: View {
                             .cornerRadius(4)
                     }
 
+                    if runner.isJIT {
+                        Text("♻️ JIT")
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.teal.opacity(0.2))
+                            .cornerRadius(4)
+                            .help("Single-use: a new registration and a fresh workspace for each job")
+                    }
+
                     if let quietHours = runner.quietHours {
                         Text(quietHours.enabled ? "🌙 \(quietHours.displayRange)" : "🌙 Never pauses")
                             .font(.caption2)
