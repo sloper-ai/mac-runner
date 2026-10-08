@@ -159,13 +159,13 @@ final class JITRegistrationTests: XCTestCase {
 
     func testGenerateJITConfigRequest() {
         let repo = GHCLIService.generateJITConfigArguments(
-            for: RunnerTarget(scope: .repo, identifier: "sloper-ai/sloper-new"),
+            for: RunnerTarget(scope: .repo, identifier: "octo-org/octo-repo"),
             name: "linux-mbp-1-3fa29c",
             labels: ["self-hosted", "Linux", "ARM64", "local"],
             workFolder: "/mac-runner/_work"
         )
         XCTAssertEqual(repo, [
-            "api", "-X", "POST", "repos/sloper-ai/sloper-new/actions/runners/generate-jitconfig",
+            "api", "-X", "POST", "repos/octo-org/octo-repo/actions/runners/generate-jitconfig",
             "-f", "name=linux-mbp-1-3fa29c",
             "-F", "runner_group_id=1",
             "-f", "work_folder=/mac-runner/_work",
@@ -237,7 +237,7 @@ final class JITRegistrationTests: XCTestCase {
 
     /// The deletion stopping and exiting both use: 404 means GitHub already deleted it.
     func testDeletingARegistrationTreats404AsDone() async throws {
-        let target = RunnerTarget(scope: .repo, identifier: "sloper-ai/sloper-new")
+        let target = RunnerTarget(scope: .repo, identifier: "octo-org/octo-repo")
 
         let deleted = try standInGH()
         defer { try? FileManager.default.removeItem(at: deleted.root) }
@@ -245,7 +245,7 @@ final class JITRegistrationTests: XCTestCase {
         XCTAssertEqual(outcome, .deleted)
         XCTAssertEqual(
             try String(contentsOf: deleted.calls, encoding: .utf8).split(separator: "\n").map(String.init),
-            ["api", "-X", "DELETE", "repos/sloper-ai/sloper-new/actions/runners/23"]
+            ["api", "-X", "DELETE", "repos/octo-org/octo-repo/actions/runners/23"]
         )
 
         let gone = try standInGH(stderr: "gh: Not Found (HTTP 404)", status: 1)
@@ -336,7 +336,7 @@ final class JITLaunchTests: XCTestCase {
 
     private func jitVariables(cacheDirectories: [String] = []) -> [(name: String, value: String)] {
         ContainerRunnerScript.variables(
-            registrationURL: "https://github.com/sloper-ai/sloper-new",
+            registrationURL: "https://github.com/octo-org/octo-repo",
             registration: .jitConfig(jitConfig),
             runnerName: "linux-mbp-1",
             labels: ["self-hosted", "Linux", "ARM64", "local"],
@@ -385,7 +385,7 @@ final class JITLaunchTests: XCTestCase {
             runnerID: runnerID,
             runnerName: "linux-mbp-1",
             runnerDirectory: "/Users/me/.mac-runner/runners/\(runnerID.uuidString)",
-            image: "sloper-ci-linux:latest",
+            image: "octo-org/ci:latest",
             cpus: 4,
             memoryMB: 8192,
             openFileLimit: 65536,
@@ -419,7 +419,7 @@ final class JITLaunchTests: XCTestCase {
         let variables = jitVariables(cacheDirectories: cachePaths)
         let launcher = try DockerRunnerEngine.writeLaunchFiles(
             docker: docker.path, runnerID: runnerID, runnerName: "linux-mbp-1", runnerDirectory: runnerDirectory.path,
-            image: "sloper-ci-linux:latest", cpus: 4, memoryMB: 8192, openFileLimit: 4096,
+            image: "octo-org/ci:latest", cpus: 4, memoryMB: 8192, openFileLimit: 4096,
             environmentNames: variables.map(\.name),
             resetWorkVolume: true,
             cacheMounts: DockerRunnerEngine.cacheMounts(for: runnerID, paths: cachePaths)
@@ -706,8 +706,8 @@ final class JITCommandTests: XCTestCase {
 
     func testParsesJITToolsAndCaches() throws {
         let command = try parse([
-            "sloper-ai/sloper-new", "--name", "linux-mbp-1", "--isolation", "container", "--engine", "docker",
-            "--image", "sloper-ci-linux:latest", "--cpus", "4", "--memory", "8g", "--labels", "self-hosted,Linux,ARM64,local",
+            "octo-org/octo-repo", "--name", "linux-mbp-1", "--isolation", "container", "--engine", "docker",
+            "--image", "octo-org/ci:latest", "--cpus", "4", "--memory", "8g", "--labels", "self-hosted,Linux,ARM64,local",
             "--jit", "--no-tools", "--cache", "/home/runner/.cargo/registry", "--cache", "/home/runner/.cache/uv/",
             "--cache", "/home/runner/.cargo/registry",
         ]).get()
@@ -779,18 +779,18 @@ final class JITConfigFileTests: XCTestCase {
     private let yaml = """
     runners:
       - name: linux-mbp-1
-        repo: sloper-ai/sloper-new
+        repo: octo-org/octo-repo
         labels: [self-hosted, Linux, ARM64, local]
         isolation: container
         engine: docker
-        image: sloper-ci-linux:latest
+        image: octo-org/ci:latest
         cpus: 4
         memory: 8g
         jit: true
         tools: []
         cache: [/home/runner/.cargo/registry, "/home/runner/.cargo/git/"]
       - name: macos-mbp-1
-        repo: sloper-ai/sloper-new
+        repo: octo-org/octo-repo
         labels: [self-hosted, macOS, ARM64, local]
         isolation: user
         jit: true
