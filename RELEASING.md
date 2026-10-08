@@ -1,145 +1,53 @@
 # Releasing Mac Runner
 
-## Automated Release Process
+Releases of this fork are automatic. Every push to `main` runs the [Release workflow](.github/workflows/release.yml), and [semantic-release](https://github.com/semantic-release/semantic-release) works out from the commit messages whether a release is due.
 
-Releases are automated via GitHub Actions. Just push a tag:
+## Conventional Commits decide the version
 
-```bash
-# Create and push a new version tag
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin v0.1.0
-```
+| Commits on `main` since the last release | Release |
+| --- | --- |
+| a `feat:` | minor: 1.25.1 → 1.26.0 |
+| a `fix:` or `perf:`, and no `feat:` | patch: 1.25.1 → 1.25.2 |
+| a breaking change: `feat!:`, `fix!:` or a `BREAKING CHANGE:` footer | major: 1.25.1 → 2.0.0 |
+| only `docs:`, `ci:`, `build:`, `chore:`, `refactor:`, `test:` or `style:` | none |
 
-The GitHub Action will:
-1. Build universal binary (arm64 + x86_64)
-2. Create app bundle
-3. Generate DMG
-4. Create ZIP for Homebrew
-5. Create GitHub release with artifacts
-6. Update Homebrew formula automatically
+`main` takes squash merges only, so semantic-release sees one commit per pull request, and GitHub gives it the pull request's title (the commit's, for a one-commit pull request). Give pull requests a Conventional Commits title.
 
-## Manual Release Process
+Versions continue from the tags the fork inherited from upstream; `v1.25.1` is the latest. The rules are in [`.releaserc.json`](.releaserc.json).
 
-If you need to release manually:
+## What a release does
 
-### 1. Build Release Binary
+When a release is due, semantic-release, on a GitHub-hosted `macos-26` runner:
 
-```bash
-make release
-```
+1. Works out the version and the release notes, and adds the notes to `CHANGELOG.md`.
+2. Runs `scripts/build-release.sh <version>`, which builds a universal (arm64 + x86_64) release binary, assembles `build/MacRunner.app` with an `Info.plist` for that version, signs it, zips it to `build/MacRunner-<version>.zip`, and writes the version and the zip's SHA-256 into `Casks/mac-runner.rb`.
+3. Commits `CHANGELOG.md` and `Casks/mac-runner.rb` to `main` as `chore(release): <version> [skip ci]` and tags that commit `v<version>`.
+4. Publishes the GitHub release with the zip attached.
 
-### 2. Create App Bundle
+When no release is due, nothing is built. semantic-release doesn't comment on issues or pull requests: issues are disabled in this fork.
 
-```bash
-make app
-```
+## The Homebrew tap
 
-### 3. Create DMG
+This repository is the tap: `Casks/mac-runner.rb` on `main` is what `brew` installs, and every release moves it to the new version (step 3). The repository isn't named `homebrew-…`, so people tap it by URL:
 
 ```bash
-make dmg
+brew tap sloper-ai/mac-runner https://github.com/sloper-ai/mac-runner
+brew install --cask sloper-ai/mac-runner/mac-runner
 ```
 
-### 4. Create ZIP for Homebrew
+The app checks this repository's latest release for updates and, when the cask installed it, upgrades with `brew upgrade --cask sloper-ai/mac-runner/mac-runner`.
 
-```bash
-cd build
-zip -r MacRunner-0.1.0.zip MacRunner.app
-shasum -a 256 MacRunner-0.1.0.zip
-```
+## The token for the release commit
 
-### 5. Create GitHub Release
+Step 3 pushes to `main` directly. The organization's ruleset for default branches requires pull requests, and the workflow's `GITHUB_TOKEN` may not bypass it, so with `GITHUB_TOKEN` alone a release fails at that push, after the build: no commit, tag or release is created.
 
-```bash
-gh release create v0.1.0 \
-  --title "Mac Runner v0.1.0" \
-  --notes "Release notes here" \
-  build/MacRunner-0.1.0.dmg \
-  build/MacRunner-0.1.0.zip
-```
+Give the workflow a token that may push to `main` as a repository secret named `RELEASE_TOKEN`, for example a fine-grained personal access token of an organization admin with **Contents: Read and write** on this repository. The workflow uses it in place of `GITHUB_TOKEN` whenever it is set. Exempting this repository from the ruleset works too.
 
-### 6. Update Homebrew Formula
+## Signing and notarization
 
-Edit `Formula/mac-runner.rb`:
+By default releases are signed **ad hoc** with `scripts/MacRunner.entitlements`: no Apple Developer ID, no notarization. macOS won't open a quarantined app signed that way, so the cask removes the `com.apple.quarantine` flag after installing (its caveats say so), and people who download the zip themselves clear the flag by hand (see the README).
 
-```ruby
-class MacRunner < Formula
-  desc "Menu bar app for managing GitHub Actions self-hosted runners"
-  homepage "https://github.com/omniaura/mac-runner"
-  url "https://github.com/omniaura/mac-runner/releases/download/v0.1.0/MacRunner-0.1.0.zip"
-  sha256 "YOUR_SHA256_HERE"
-  version "0.1.0"
-  # ...
-end
-```
-
-Commit and push:
-
-```bash
-git add Formula/mac-runner.rb
-git commit -m "Update Homebrew formula to v0.1.0"
-git push origin main
-```
-
-## Version Numbering
-
-We use semantic versioning:
-
-- **Major** (1.0.0): Breaking changes, major features
-- **Minor** (0.1.0): New features, backwards compatible
-- **Patch** (0.1.1): Bug fixes, minor improvements
-
-## Pre-Release Checklist
-
-Before tagging a release:
-
-- [ ] All tests pass: `make test`
-- [ ] Code builds without warnings: `make build`
-- [ ] README is up to date
-- [ ] CHANGELOG is updated
-- [ ] Version numbers are consistent
-- [ ] Test the app manually
-- [ ] Check Homebrew formula syntax
-
-## Post-Release
-
-After release is published:
-
-1. Test Homebrew installation:
-   ```bash
-   brew tap omniaura/tap https://github.com/omniaura/mac-runner
-   brew install --cask mac-runner
-   ```
-
-2. Verify the app launches and works
-
-3. Announce on social media / Discord / etc.
-
-4. Update any documentation that references version numbers
-
-## Troubleshooting
-
-### Build fails on GitHub Actions
-
-- Check Xcode version compatibility
-- Verify Package.swift dependencies
-- Check for missing code signing certificates
-
-### Homebrew formula issues
-
-- Verify SHA256 matches the ZIP file
-- Check URL is accessible
-- Test formula locally: `brew install --build-from-source Formula/mac-runner.rb`
-
-### DMG creation fails
-
-Falls back to simple hdiutil DMG if create-dmg fails. This is normal and acceptable.
-
-## Code Signing & Notarization
-
-Code signing and notarization are fully automated in the release workflow. The app is signed with a Developer ID Application certificate and notarized with Apple, so users will not see Gatekeeper warnings.
-
-### Required GitHub Secrets
+Releases switch to Developer ID signing with the hardened runtime, and to notarization, once these repository secrets exist:
 
 | Secret | Description |
 |--------|-------------|
@@ -152,11 +60,24 @@ Code signing and notarization are fully automated in the release workflow. The a
 | `APPLE_ID` | Optional fallback: Apple ID email used for notarization |
 | `APPLE_ID_PASSWORD` | Optional fallback: app-specific password for notarization |
 
-### How it works
+With the certificate secrets set, the workflow imports the certificate into a temporary keychain and exports `SIGNING_IDENTITY`. `scripts/build-release.sh` then signs the app with it, notarizes the zip through `scripts/notarize.sh` when the notarization secrets are set as well, staples the ticket and zips the stapled app again. The keychain and the API key are deleted at the end of the job. Once releases are notarized, the cask's `postflight_steps` and its quarantine caveat can go.
 
-1. A temporary keychain is created, the Developer ID certificate is imported, and the signing identity is discovered dynamically
-2. The workflow clears extended attributes, signs nested bundles bottom-up, signs the main executable, and then signs the `.app`
-3. The release ZIP is created with `ditto --keepParent` so macOS metadata survives notarization round-trips
-4. Notarization uses an App Store Connect API key when configured, falls back to Apple ID credentials otherwise, and prints Apple log output on failure
-5. The app and DMG are both stapled and validated after notarization before release artifacts are uploaded
-6. Temporary keychain and notarization key material are cleaned up at the end of the job
+## Building a release locally
+
+```bash
+./scripts/build-release.sh 0.0.0-test   # build/MacRunner.app and build/MacRunner-0.0.0-test.zip
+git checkout Casks/mac-runner.rb        # the script pointed the cask at the local zip
+```
+
+`make app` builds the same universal app bundle without zipping it or touching the cask.
+
+## Releasing by hand
+
+To retry a failed release, rerun the Release workflow, or run it from the **Actions** tab (**Run workflow** on `main`). It still releases only if there are unreleased `feat:`, `fix:` or `perf:` commits. To release a change that was merged without one, merge a commit such as `fix: release <change>` (see [AGENTS.md](AGENTS.md)).
+
+## Troubleshooting
+
+- **No workflow runs at all.** GitHub disables workflows in a new fork until someone enables them on the repository's **Actions** tab.
+- **`startup_failure`.** The organization allows only GitHub-owned actions (`actions/*`), pinned to a full commit SHA with the version in a comment, such as `actions/checkout@<sha> # v7.0.1`. `gh api repos/actions/checkout/git/ref/tags/v7.0.1` gives the SHA; if its object is a `tag`, `gh api repos/actions/checkout/git/tags/<sha>` gives the commit it points to.
+- **The release commit's push is rejected.** See [The token for the release commit](#the-token-for-the-release-commit).
+- **The build fails.** The package needs Swift 6, and Apple's Containerization needs Xcode 26 or newer; the default Xcode of `macos-26` has both. The workflow's *Show toolchain* step prints the versions in use.
