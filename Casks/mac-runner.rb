@@ -1,7 +1,7 @@
 cask "mac-runner" do
   # scripts/build-release.sh sets both on every release.
-  version "1.25.1"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  version "1.26.0"
+  sha256 "f3add026706a06485d53cc98c23865fb90938582c149e4cb279e6d8e8110d324"
 
   url "https://github.com/sloper-ai/mac-runner/releases/download/v#{version}/MacRunner-#{version}.zip"
   name "Mac Runner"
