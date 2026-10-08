@@ -1,5 +1,9 @@
 # Mac Runner
 
+> **This is sloper-ai's fork of [omniaura/mac-runner](https://github.com/omniaura/mac-runner).**
+> It adds a Docker engine for container runners, with more features to come. Releases,
+> the Homebrew tap and in-app updates all come from this repository.
+
 Simple Mac menu bar app and CLI for managing GitHub Actions self-hosted runners.
 
 ## Features
@@ -39,13 +43,36 @@ GitHub Actions self-hosted runners are great, but:
 
 ### Homebrew
 
+This repository is its own Homebrew tap. Its name doesn't start with `homebrew-`, so tap it by URL:
+
 ```bash
-brew install --cask omniaura/tap/mac-runner
+brew tap sloper-ai/mac-runner https://github.com/sloper-ai/mac-runner
+brew install --cask sloper-ai/mac-runner/mac-runner
 ```
+
+Use the fully qualified name: a bare `mac-runner` is ambiguous while upstream's `omniaura/tap` is tapped too, and naming the cask in full is also how Homebrew comes to trust a cask from a third-party tap. Update with `brew upgrade --cask sloper-ai/mac-runner/mac-runner`, or with **Install Update** in the menu bar when Mac Runner offers one.
+
+Releases are signed ad hoc, not with an Apple Developer ID, and are not notarized. So that macOS opens the app, the cask removes the `com.apple.quarantine` flag after installing it.
+
+### Switching from upstream's cask
+
+If you installed `omniaura/tap/mac-runner`, quit Mac Runner, then:
+
+```bash
+brew uninstall --cask mac-runner
+brew tap sloper-ai/mac-runner https://github.com/sloper-ai/mac-runner
+brew install --cask sloper-ai/mac-runner/mac-runner
+```
+
+A plain `brew uninstall` removes only the app. It doesn't deregister your runners or delete their workspaces, and the fork keeps upstream's bundle ID, settings and paths, so it picks up your runners and configuration as they are. Don't use `brew uninstall --zap` or `mac-runner uninstall` for the switch: both delete your runners' workspaces and settings, and `mac-runner uninstall` also deregisters the runners from GitHub. If you use nothing else from upstream's tap, `brew untap omniaura/tap` afterwards.
 
 ### Direct Download
 
-Download the latest DMG from [Releases](https://github.com/omniaura/mac-runner/releases)
+Download `MacRunner-<version>.zip` from [Releases](https://github.com/sloper-ai/mac-runner/releases), unzip it and move `MacRunner.app` to `/Applications`. The app isn't notarized, so clear the quarantine flag before opening it the first time:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/MacRunner.app
+```
 
 ### Prerequisites
 
@@ -259,11 +286,11 @@ Container runners install the GitHub CLI, the toolchains detected in the reposit
 
 ## CI/CD: Self-Hosted Runner with Automatic Cloud Fallback
 
-Mac Runner uses a pattern that automatically routes CI jobs to your self-hosted Mac when it's online, and falls back to GitHub-hosted cloud runners when it's not. This means pushes to main always build, regardless of whether your Mac is on.
+You can route CI jobs to your self-hosted Mac when it's online, and fall back to GitHub-hosted cloud runners when it's not. This means pushes to main always build, regardless of whether your Mac is on.
 
 ### How It Works
 
-The release workflow uses [`mikehardy/runner-fallback-action`](https://github.com/mikehardy/runner-fallback-action) to query the GitHub API for available self-hosted runners before the build job starts:
+[`mikehardy/runner-fallback-action`](https://github.com/mikehardy/runner-fallback-action) queries the GitHub API for available self-hosted runners before the build job starts:
 
 ```yaml
 jobs:
@@ -486,6 +513,10 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) for automati
 - `feat:` — New feature (minor bump)
 - `fix:` — Bug fix (patch bump)
 - `chore:` — No release
+
+### Releases
+
+Every push to `main` runs semantic-release, which reads the Conventional Commits since the last release: `feat:` releases a minor version, `fix:` a patch. It then builds the app, publishes a [GitHub release](https://github.com/sloper-ai/mac-runner/releases) with the app attached, and moves the cask in this repository to the new version through a pull request that it merges itself. See [RELEASING.md](RELEASING.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for full guidelines.
 

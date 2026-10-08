@@ -27,7 +27,7 @@ final class UpdateInstallerTests: XCTestCase {
         )
 
         XCTAssertEqual(command.executable, "/usr/local/bin/brew")
-        XCTAssertEqual(command.arguments, ["upgrade", "--cask", "mac-runner"])
+        XCTAssertEqual(command.arguments, ["upgrade", "--cask", "sloper-ai/mac-runner/mac-runner"])
     }
 
     func testCommandRejectsDirectDownloads() {
@@ -64,7 +64,7 @@ final class UpdateInstallerTests: XCTestCase {
         AvailableUpdate(
             currentVersion: "1.0.0",
             latestVersion: "v1.2.0",
-            releaseURL: URL(string: "https://github.com/omniaura/mac-runner/releases/tag/v1.2.0")!,
+            releaseURL: URL(string: "https://github.com/sloper-ai/mac-runner/releases/tag/v1.2.0")!,
             installSource: installSource
         )
     }
