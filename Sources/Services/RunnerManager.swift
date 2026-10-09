@@ -2101,9 +2101,11 @@ class RunnerManager: ObservableObject {
     nonisolated static func resetDirectory(_ directory: URL) async throws {
         try await Task.detached(priority: .userInitiated) {
             let fileManager = FileManager.default
-            if fileManager.fileExists(atPath: directory.path) {
-                // Jobs can leave read-only directories, which can't be emptied as they are.
-                _ = try? ProcessExecutor.run("/bin/chmod", arguments: ["-R", "-P", "u+w", directory.path], silent: true)
+            if let attributes = try? fileManager.attributesOfItem(atPath: directory.path) {
+                // Unlink a workspace symlink itself without even chmod-ing its target.
+                if attributes[.type] as? FileAttributeType != .typeSymbolicLink {
+                    _ = try? ProcessExecutor.run("/bin/chmod", arguments: ["-R", "-P", "u+w", directory.path], silent: true)
+                }
                 try fileManager.removeItem(at: directory)
             }
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)

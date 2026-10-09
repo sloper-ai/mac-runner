@@ -111,7 +111,7 @@ enum JITRunner {
         let directory = runnerDirectory.hasSuffix("/") ? String(runnerDirectory.dropLast()) : runnerDirectory
         let work = quoted(directory + "/_work")
         // Jobs can leave read-only directories (Go's module cache, say), which rm can't empty.
-        let reset = "{ chmod -R -P u+w \(work) 2>/dev/null || true; } && rm -rf \(work) && rm -f "
+        let reset = "{ if [ ! -L \(work) ]; then chmod -R -P u+w \(work) 2>/dev/null || true; fi; } && rm -rf \(work) && rm -f "
             + credentialFileNames.map { quoted(directory + "/" + $0) }.joined(separator: " ")
         guard let configFile else { return reset }
         let file = quoted(configFile)

@@ -25,10 +25,10 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
         let protected = try [".cache/ms-playwright/chromium/browser", "Library/Caches/ms-playwright/firefox/browser",
             ".cache/unknown/toolchain", ".rustup/toolchains/stable/rustc", ".cargo/bin/cargo", ".ssh/key",
             "Library/Keychains/login.keychain-db", ".gradle/jdks/java/bin/java"].map { try file($0, in: home, age: 90 * 86400) }
-        let report = try DisposableCache.maintain(home: home, maxBytes: 1000, maxAgeDays: 7)
+        let report = try DisposableCache.maintain(home: home, maxBytes: 100_000, maxAgeDays: 7)
         XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
-        XCTAssertEqual(report.remainingBytes, 300)
+        XCTAssertGreaterThanOrEqual(report.remainingBytes, 300)
         _ = try DisposableCache.maintain(home: home, maxBytes: 200, maxAgeDays: 7)
         XCTAssertFalse(FileManager.default.fileExists(atPath: fresh.path))
         for path in protected { XCTAssertTrue(FileManager.default.fileExists(atPath: path.path), path.path) }
@@ -54,7 +54,7 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: home) }
         let old = try file(".npm/_logs/old", in: home, age: 9 * 86400)
         let result = try DisposableCache.maintain(home: home, maxBytes: 1, maxAgeDays: 7, dryRun: true)
-        XCTAssertEqual(result.reclaimedBytes, 100)
+        XCTAssertGreaterThan(result.reclaimedBytes, 0)
         XCTAssertTrue(FileManager.default.fileExists(atPath: old.path))
     }
 
@@ -277,6 +277,21 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(result.joined().contains("unsupported"))
         let calls = await stub.calls
         XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testWorkspaceSymlinkResetPreservesTargetAndItsPermissions() async throws {
+        let home = try scratch()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sentinel = try file("tools/keep", in: home)
+        let tools = sentinel.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: tools.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: tools.path) }
+        let workspace = home.appendingPathComponent("_work")
+        try FileManager.default.createSymbolicLink(at: workspace, withDestinationURL: tools)
+        try await RunnerManager.resetDirectory(workspace)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+        XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: tools.path)[.posixPermissions] as? NSNumber)?.intValue, 0o500)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: workspace.path), [])
     }
 
 }

@@ -58,9 +58,13 @@ enum DisposableCache {
             for case let item as URL in items {
                 let attributes = try fm.attributesOfItem(atPath: item.path)
                 let type = attributes[.type] as? FileAttributeType
+                var info = stat()
+                guard lstat(item.path, &info) == 0 else {
+                    throw StorageMaintenanceError(message: "Cannot measure cache entry: \(item.path)")
+                }
+                size += Int64(info.st_blocks) * 512
                 if type == .typeSymbolicLink { items.skipDescendants(); continue }
                 guard type == .typeRegular else { continue }
-                size += (attributes[.size] as? NSNumber)?.int64Value ?? 0
                 let modified = attributes[.modificationDate] as? Date ?? now
                 newestFile = max(newestFile ?? modified, modified)
             }
