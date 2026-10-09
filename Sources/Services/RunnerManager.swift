@@ -48,7 +48,7 @@ class RunnerManager: ObservableObject {
     private let pidManager = PIDFileManager()
     private let updateChecker = UpdateChecker()
     private let updateInstaller = UpdateInstaller()
-    private let diskCleanupService = DiskCleanupService()
+    private let storageMaintenanceService = StorageMaintenanceService()
     #if canImport(Containerization)
     private var _containerService: Any?  // ContainerIsolationService, but untyped for availability
     #endif
@@ -85,7 +85,9 @@ class RunnerManager: ObservableObject {
     private let restartBaseDelaySeconds = 5
     private let restartMaxDelaySeconds = 60
     private var installedUpdateVersion: String?
-    private var lastAutomaticDiskCleanupCheck: Date?
+    private var lastStorageMaintenanceCheck: Date?
+    private var lastStorageWarning: String?
+    private var storageMaintenanceTask: Task<Void, Never>?
     private var lastLogMaintenance: Date?
     private var lastDiskMeasurement: Date?
     private var workspaceSizes: [UUID: ResourceMonitor.DiskMeasurement] = [:]
@@ -211,6 +213,7 @@ class RunnerManager: ObservableObject {
 
     deinit {
         statusPollingTask?.cancel()
+        storageMaintenanceTask?.cancel()
         jobLogScanTask?.cancel()
         for task in scheduledRestarts.values {
             task.cancel()
@@ -746,6 +749,11 @@ class RunnerManager: ObservableObject {
 
     /// - Parameter holdingStartLock: The caller holds the runner's `RunnerStartLock` already.
     private func startRunner(_ id: UUID, holdingStartLock: Bool) async throws {
+        guard let admissionLock = await StorageMaintenanceService.acquireAdmissionLock() else {
+            throw RunnerError.startInProgress
+        }
+        defer { admissionLock.unlock() }
+        reloadExternalConfigChanges()
         guard let index = runners.firstIndex(where: { $0.id == id }) else {
             throw RunnerError.notFound
         }
@@ -753,7 +761,7 @@ class RunnerManager: ObservableObject {
         // A JIT runner registers on GitHub as it starts: one start at a time across
         // Mac Runner processes, and a stop anywhere waits for it.
         var startLock: RunnerStartLock?
-        if runners[index].isJIT && !holdingStartLock {
+        if !holdingStartLock {
             guard let lock = RunnerStartLock.tryAcquire(for: id) else { throw RunnerError.startInProgress }
             startLock = lock
         }
@@ -782,6 +790,52 @@ class RunnerManager: ObservableObject {
         let runnerDir = try RunnerDirectory.path(for: id, isolation: isolation)
         // Container runners install and register inside their container.
         let needsRunnerSetup = isolation != .container && !FileManager.default.fileExists(atPath: "\(runnerDir)/run.sh")
+
+        // Maintenance runs before downloads, JIT registration, or a listener that
+        // could accept work. The admission lock stays held until its PID is saved.
+        if currentSettings.automaticDiskCleanupEnabled {
+            // Persist the start intent so an external stop can cancel even a
+            // long preflight. Its stop marker is checked before registration.
+            runners[index].status = .running
+            saveConfiguration()
+            do {
+                if runner.isJIT && isolation == .none {
+                    let home = FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath()
+                    guard DisposableCache.safeDirectory(URL(fileURLWithPath: runnerDir), under: home) else {
+                        throw StorageMaintenanceError(message: "Runner directory contains a symlink; refusing workspace cleanup.")
+                    }
+                    try await Self.resetDirectory(URL(fileURLWithPath: runnerDir).appendingPathComponent("_work"))
+                }
+                let sharedIsIdle = StorageMaintenanceService.canCleanSharedCaches(
+                    runners: runners, isolation: currentSettings.isolationMode,
+                    isAlive: { processManager.isProcessAlive(for: $0) }
+                )
+                let messages = try await storageMaintenanceService.prepare(
+                    runner: runner, runners: runners, settings: currentSettings, canCleanShared: sharedIsIdle
+                )
+                for message in messages { logRunnerEvent(for: runner, message: "Storage maintenance: " + message) }
+            } catch {
+                reloadExternalConfigChanges()
+                guard let current = runners.firstIndex(where: { $0.id == id }),
+                      runners[current].status == .running, !manualStopRequests.contains(id) else { return }
+                let reason = error.localizedDescription
+                if runners[current].storageBlockedReason != reason {
+                    logRunnerEvent(for: runners[current], message: "Waiting for storage: \(reason) Retrying in 60s without registering a runner.")
+                }
+                runners[current].status = .paused
+                runners[current].storageBlockedReason = reason
+                runners[current].lastRestartEvent = "Waiting for storage: " + reason
+                runners[current].busy = false
+                saveConfiguration()
+                return
+            }
+        }
+
+        reloadExternalConfigChanges()
+        if currentSettings.automaticDiskCleanupEnabled {
+            guard runners.first(where: { $0.id == id })?.status == .running,
+                  !manualStopRequests.contains(id) else { return }
+        }
 
         // Ensure runner binary is downloaded and configured
         if needsRunnerSetup {
@@ -1023,6 +1077,11 @@ class RunnerManager: ObservableObject {
             runners[index].autoPauseOverride = reason
             runners[index].autoPauseReason = nil
         }
+        if runners[index].storageBlockedReason != nil {
+            runners[index].lastRestartEvent = "Storage reserves recovered; runner resumed."
+            logRunnerEvent(for: runners[index], message: runners[index].lastRestartEvent ?? "")
+        }
+        runners[index].storageBlockedReason = nil
         runners[index].status = .running
         saveConfiguration()
     }
@@ -1055,7 +1114,10 @@ class RunnerManager: ObservableObject {
         var startLock: RunnerStartLock?
         if runner.isJIT && !appleVMIsHostedElsewhere(runner) {
             markStopped(id)
-            startLock = await RunnerStartLock.acquire(for: id, waitingUpTo: 60)
+            guard let lock = await RunnerStartLock.acquire(for: id, waitingUpTo: 330) else {
+                throw RunnerError.startInProgress
+            }
+            startLock = lock
             reloadExternalConfigChanges()
             guard let current = runners.first(where: { $0.id == id }) else { return }  // removed meanwhile
             runner = current
@@ -1105,7 +1167,7 @@ class RunnerManager: ObservableObject {
                     runnerProcesses.removeValue(forKey: id)
                 }
             }
-        } catch RunnerError.notRunning where runner.isJIT {
+        } catch RunnerError.notRunning where runner.isJIT || runner.storageBlockedReason != nil {
             // Between jobs nothing runs, but its registration still goes, below.
             manualStopRequests.remove(id)
         } catch {
@@ -1129,6 +1191,7 @@ class RunnerManager: ObservableObject {
         // Look the runner up again: the list can be replaced during the awaits above.
         guard let index = runners.firstIndex(where: { $0.id == id }) else { return }
         runners[index].status = .stopped
+        runners[index].storageBlockedReason = nil
         runners[index].autoPauseOverride = nil
         // A stopped runner isn't executing anything; don't let a stale flag
         // show job activity after it restarts.
@@ -1281,9 +1344,8 @@ class RunnerManager: ObservableObject {
 
         do {
             try await startRunner(id)
-            if let runner = runners.first(where: { $0.id == id }) {
-                logRunnerEvent(for: runner, message: "Resumed after auto-pause.")
-            }
+            guard let runner = runners.first(where: { $0.id == id }), runner.status == .running else { return false }
+            logRunnerEvent(for: runner, message: "Resumed after auto-pause.")
             return true
         } catch {
             if let refreshedIndex = runners.firstIndex(where: { $0.id == id }) {
@@ -1330,6 +1392,7 @@ class RunnerManager: ObservableObject {
 
     /// Short status for a runner's auto-pause state, for the runner list.
     func autoPauseStatus(for runner: Runner, now: Date = Date()) -> String? {
+        if let reason = runner.storageBlockedReason { return "Waiting for storage: " + reason }
         if runner.status == .paused, let reason = runner.autoPauseReason {
             switch reason {
             case .lowBattery:
@@ -2038,9 +2101,11 @@ class RunnerManager: ObservableObject {
     nonisolated static func resetDirectory(_ directory: URL) async throws {
         try await Task.detached(priority: .userInitiated) {
             let fileManager = FileManager.default
-            if fileManager.fileExists(atPath: directory.path) {
-                // Jobs can leave read-only directories, which can't be emptied as they are.
-                _ = try? ProcessExecutor.run("/bin/chmod", arguments: ["-R", "u+w", directory.path], silent: true)
+            if let attributes = try? fileManager.attributesOfItem(atPath: directory.path) {
+                // Unlink a workspace symlink itself without even chmod-ing its target.
+                if attributes[.type] as? FileAttributeType != .typeSymbolicLink {
+                    _ = try? ProcessExecutor.run("/bin/chmod", arguments: ["-R", "-P", "u+w", directory.path], silent: true)
+                }
                 try fileManager.removeItem(at: directory)
             }
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -2278,7 +2343,7 @@ class RunnerManager: ObservableObject {
             await restartRunnersWithStalePathSnapshots(candidateIDs: becameIdleRunnerIDs)
         }
 
-        runAutomaticDiskCleanupIfNeeded()
+        runStorageMaintenanceIfNeeded()
         maintainRunnerLogsIfNeeded()
 
         if automationEnabled {
@@ -2327,29 +2392,37 @@ class RunnerManager: ObservableObject {
         }
     }
 
-    private func runAutomaticDiskCleanupIfNeeded(now: Date = Date()) {
-        guard currentSettings.automaticDiskCleanupEnabled else { return }
-        if let lastCheck = lastAutomaticDiskCleanupCheck,
-           now.timeIntervalSince(lastCheck) < 3600 {
-            return
-        }
-        lastAutomaticDiskCleanupCheck = now
-
-        let threshold = Int64(currentSettings.minimumFreeDiskSpaceGB) * 1_000_000_000
-        guard let available = diskCleanupService.availableDiskBytes(), available < threshold else { return }
-
-        do {
-            let report = try diskCleanupService.cleanup(
-                runners: runners,
-                globalIsolationMode: currentSettings.isolationMode,
-                includeSharedCaches: true,
-                dryRun: false
-            )
-            if report.reclaimedBytes > 0 {
-                print("Automatic disk cleanup reclaimed \(ByteCountFormatter.string(fromByteCount: report.reclaimedBytes, countStyle: .file)).")
+    /// The app owns retries and daily VM TRIM. CLI instances do preflight only.
+    private func runStorageMaintenanceIfNeeded(now: Date = Date()) {
+        guard automationEnabled, storageMaintenanceTask == nil else { return }
+        if let last = lastStorageMaintenanceCheck, now.timeIntervalSince(last) < 60 { return }
+        lastStorageMaintenanceCheck = now
+        storageMaintenanceTask = Task { [weak self] in
+            guard let self else { return }
+            defer { storageMaintenanceTask = nil }
+            reloadExternalConfigChanges()
+            if let lock = StorageMaintenanceService.admissionLock() {
+                let messages = await storageMaintenanceService.trimIfDue(
+                    settings: currentSettings,
+                    hasDockerRunners: runners.contains { $0.runsInDocker(global: currentSettings.isolationMode) }
+                )
+                lock.unlock()
+                for message in messages { print("Storage maintenance: " + message) }
             }
-        } catch {
-            print("Automatic disk cleanup failed: \(error.localizedDescription)")
+            let warning = await storageMaintenanceService.monitor(runners: runners, settings: currentSettings)
+            if warning != lastStorageWarning {
+                print(warning.map { "Storage warning: " + $0 + " Running jobs are preserved; new starts wait for space." } ?? "Storage reserves recovered.")
+                lastStorageWarning = warning
+            }
+            let waiting = runners.filter { $0.status == .paused && $0.storageBlockedReason != nil && $0.enabled }.map(\.id)
+            for id in waiting {
+                guard let runner = runners.first(where: { $0.id == id }),
+                      runner.status == .paused, runner.storageBlockedReason != nil,
+                      pauseReasonBetweenJobs(for: runner) == nil else { continue }
+                do { try await startRunner(id) }
+                catch RunnerError.alreadyRunning { /* Another process recovered it. */ }
+                catch { print("Storage retry deferred: \(error.localizedDescription)") }
+            }
         }
     }
 
@@ -2689,7 +2762,7 @@ class RunnerManager: ObservableObject {
 
         do {
             try await startRunner(id)
-            if let refreshedIndex = runners.firstIndex(where: { $0.id == id }) {
+            if let refreshedIndex = runners.firstIndex(where: { $0.id == id }), runners[refreshedIndex].storageBlockedReason == nil {
                 runners[refreshedIndex].lastRestartEvent = "Runner auto-restarted successfully."
                 logRunnerEvent(for: runners[refreshedIndex], message: runners[refreshedIndex].lastRestartEvent ?? "")
                 saveConfiguration()
@@ -3087,7 +3160,7 @@ class RunnerManager: ObservableObject {
             try await stopRunner(id)
             try await startRunner(id)
 
-            if let refreshedIndex = runners.firstIndex(where: { $0.id == id }) {
+            if let refreshedIndex = runners.firstIndex(where: { $0.id == id }), runners[refreshedIndex].storageBlockedReason == nil {
                 runners[refreshedIndex].lastRestartEvent = "Runner restarted to apply current Homebrew tool paths."
                 logRunnerEvent(for: runners[refreshedIndex], message: runners[refreshedIndex].lastRestartEvent ?? "")
                 saveConfiguration()

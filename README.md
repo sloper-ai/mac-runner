@@ -19,7 +19,7 @@ Simple Mac menu bar app and CLI for managing GitHub Actions self-hosted runners.
 - 📊 Monitor runner status from menu bar
 - ⚡ Native Mac app, lightweight and fast
 - 🤖 **Fully automated setup**: downloads and configures runners automatically, and provisions `gh` plus the repo's toolchains (Node, Python, Go, Ruby, Rust) on the host or in containers
-- 🧹 **Disk pressure cleanup**: safely reclaim idle runner workspaces and CI caches
+- 🧹 **Storage maintenance**: bound disposable caches between jobs, check Mac and Docker free space, and trim local Colima disks daily
 - 🔋 **Auto-pause**: pause runners on low battery or during quiet hours (per-runner schedules), finishing the current job first and resuming automatically
 - 📈 **Resource monitoring**: per-runner CPU, memory, and workspace size, with optional alerts (`mac-runner status --resources`)
 - 📜 **Log viewer**: live-tail, filter, and export runner output and diagnostics (`mac-runner logs <name> --follow`), with log rotation
@@ -130,7 +130,32 @@ Runners started via CLI persist in the background — they survive the terminal 
 
 GitHub Actions jobs can leave large workspaces and dependency caches behind. `mac-runner cleanup` removes the contents of stopped runners' `_work` directories plus known npm, SwiftPM, Homebrew, Go, Cargo, Gradle, and Xcode caches. If any runner is active, its workspace is skipped and shared caches are preserved.
 
-In Settings, enable **Clean CI Data When Disk Space Is Low** and choose a minimum free-space target. Mac Runner checks at most once per hour and only cleans when available space falls below that target. Automatic cleanup is off by default.
+In Settings, enable **Maintain Storage Between Jobs**. Mac Runner cleans before starting a listener or requesting JIT credentials. Automatic maintenance stays off when upgrading an existing installation; enable it in Settings or through `apply`:
+
+```yaml
+settings:
+  automatic-disk-cleanup: true
+  minimum-free-disk-space-gb: 40  # Mac reserve; existing default remains 100
+  minimum-guest-free-disk-space-gb: 10
+  cache-max-age-days: 7
+  max-cache-size-gb: 10
+  max-docker-data-size-gb: 15
+  daily-vm-trim: true
+```
+
+The cache budget covers the combined allowlisted package caches in the native account's home, or in one Docker runner's cache volumes. These are decimal GB. A cache whose regular files have all gone seven days without a write is emptied as a unit. If the combined caches exceed the budget, they are all emptied. Whole-cache removal avoids partial npx installations and package indexes. Cache hits do not update file modification times. Both engines count allocated blocks. A running job may exceed a budget; maintenance enforces it at the next start.
+
+The allowlist includes npm's `_cacache`, `_npx`, and `_logs`; pip, uv, Go build and sccache caches; Cargo registry downloads, indexes and extracted sources, plus Git checkouts/databases; Gradle caches; Homebrew and SwiftPM download/build caches; and Xcode DerivedData. General `.cache` and `Library/Caches` directories are never emptied. Playwright browser bundles, unknown cache paths, installed SDKs, credentials, Xcode, and tool installations are preserved. Symlink roots or parents are skipped; links inside a cleaned cache are unlinked without following their targets. Dedicated-user isolation skips shared cache eviction; its existing workspace lifecycle remains unchanged.
+
+Shared native caches wait until no configured native runner process is alive, including idle listeners. CLI and GUI starts hold the same cross-process lock through maintenance and PID publication. Docker cleanup checks that no container, including a stopped container, references that runner's volumes. It mounts only the runner's cache volumes in a temporary helper using the locally available configured image, with networking disabled and no credentials. Unrecognized cache paths are preserved.
+
+Each Docker-in-Docker data volume is disposable job data. Mac Runner resets it on the first maintained start, after seven days since its last reset, above 15 GB, or under disk pressure. This discards the previous job's inner images and volumes. It never prunes the outer Docker daemon's images, containers, or unrelated volumes: configured runner images survive. The 10 GB package and 15 GB private Docker budgets leave room for workspaces and images on an 80 GB VM with two Linux slots.
+
+Mac and Docker guest reserves are checked independently after cleanup. A failed measurement or insufficient space puts the runner in **paused / waiting for storage**, before registration. The menu app retries every minute without consuming crash retries, including after app restarts. Stop the runner to cancel these retries. Running jobs continue, with pressure reported in the app's existing log; new starts wait. Lower a reserve or free space to recover. Maintenance summaries and errors appear in `runner.log`; `status` shows the waiting reason. Log rotation (10 MiB, three backups) and seven-day diagnostic retention are unchanged.
+
+With a matching local Colima socket and profile, Mac Runner runs the guest's `fstrim` once per 24 hours, retaining the successful date across app restarts and retrying failures at most hourly. This follows [Colima's documented reclamation mechanism](https://github.com/abiosoft/colima/blob/main/docs/FAQ.md). It discards only unused filesystem blocks and may run during jobs. It never stops, resizes, or rewrites the VM disk. Remote Docker endpoints and other VM backends log that TRIM is unsupported; their guest free-space checks still work. An idle app also runs daily TRIM and read-only pressure checks. Filesystem snapshots can delay physical space reclamation.
+
+To roll back, stop new registrations, let current jobs finish, and restore the previous app and saved configuration. Cache contents already discarded are downloaded or rebuilt by subsequent jobs.
 
 Use `mac-runner cleanup --workspaces-only` to preserve all shared caches.
 

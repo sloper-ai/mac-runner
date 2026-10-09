@@ -628,7 +628,7 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
 
-                    Toggle("Clean CI Data When Disk Space Is Low", isOn: Binding(
+                    Toggle("Maintain Storage Between Jobs", isOn: Binding(
                         get: { runnerManager.currentSettings.automaticDiskCleanupEnabled },
                         set: { newValue in
                             var settings = runnerManager.currentSettings
@@ -661,9 +661,11 @@ struct SettingsView: View {
                         .labelsHidden()
                     }
 
-                    Text("At most once per hour, removes stopped-runner workspaces and known CI caches. Active runner data is always preserved.")
+                    Text("Before starting runners, bounds disposable caches and checks Mac and Docker free space. Low-space runners wait and retry every minute. Local Colima disks are trimmed daily.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    StorageMaintenanceSettingsSection()
 
                     AutoPauseSettingsSection()
 
