@@ -46,7 +46,13 @@ enum DisposableCache {
         var report = Report()
         var retained: [(URL, Int64)] = []
         for root in roots {
-            guard let items = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { continue }
+            var traversalError: Error?
+            guard let items = fm.enumerator(at: root, includingPropertiesForKeys: nil, errorHandler: { _, error in
+                traversalError = error
+                return false
+            }) else {
+                throw StorageMaintenanceError(message: "Cannot enumerate cache: \(root.path)")
+            }
             var size: Int64 = 0
             var newestFile: Date?
             for case let item as URL in items {
@@ -58,6 +64,7 @@ enum DisposableCache {
                 let modified = attributes[.modificationDate] as? Date ?? now
                 newestFile = max(newestFile ?? modified, modified)
             }
+            if let traversalError { throw traversalError }
             // Evict a whole cache, never isolated files from its package indexes
             // or npx installations. Mtime describes writes, not cache hits.
             if newestFile.map({ $0 < cutoff }) ?? true {

@@ -112,7 +112,7 @@ struct StorageMaintenanceService: Sendable {
             _ = try await require(docker, ["volume", "rm", "-f", work])
         }
         let image = runner.containerImage ?? ContainerRunnerConfiguration.defaultRunnerImage
-        var args = ["run", "--rm", "--pull=never", "--network=none", "--read-only", "--user=0", "--cap-drop=ALL",
+        var args = ["run", "--rm", "--pull=never", "--network=none", "--read-only", "--user=0", "--cap-drop=ALL", "--cap-add=DAC_OVERRIDE", "--cap-add=FOWNER",
                     "--security-opt=no-new-privileges", "--pids-limit=128", "--memory=256m",
                     "--mount", "type=volume,src=\(work),dst=/storage-work,volume-nocopy"]
         var roots: [String] = []
@@ -128,7 +128,7 @@ struct StorageMaintenanceService: Sendable {
         }
         args += ["-e", "MR_CACHE_AGE=\(policy.cacheMaxAgeDays)", "-e", "MR_CACHE_BYTES=\(StorageMaintenanceSettings.bytes(policy.maxCacheSizeGB))",
                  "-e", "MR_GUEST_BYTES=\(StorageMaintenanceSettings.bytes(policy.minimumGuestFreeDiskSpaceGB))",
-                 "-e", "MR_PRESSURE=\(pressure ? 1 : 0)", "--entrypoint", "/bin/sh", image,
+                 "-e", "MR_PRESSURE=\(pressure ? 1 : 0)", "--entrypoint", "/bin/bash", image,
                  "-c", StorageMaintenanceScript.script, "storage-maintenance"] + roots
         let output = try await helper(docker, args)
         var messages = ["Docker package caches: \(StorageMaintenanceScript.value("MR_CACHE_REMAINING", in: output) ?? 0) bytes retained."]

@@ -4,7 +4,7 @@ import Foundation
 /// before obtaining JIT credentials. Only that runner's named volumes are mounted.
 enum StorageMaintenanceScript {
     static let script = #"""
-    set -eu
+    set -euo pipefail
     # Physical traversal only. A cache root with a symlink component is skipped.
     safe_dir() {
       [ -d "$1" ] || return 1
