@@ -477,9 +477,8 @@ class RunnerManager: ObservableObject {
 
         func restart(_ id: UUID) async {
             defer { autoRestartPendingIDs.remove(id) }
-            do {
-                try await startRunner(id)
-            } catch {
+            let isJIT = runners.first(where: { $0.id == id })?.isJIT == true
+            if await RunnerStartupRecovery.failure(isJIT: isJIT, start: { try await self.startRunner(id) }) != nil {
                 if let index = runners.firstIndex(where: { $0.id == id }) {
                     runners[index].status = .error
                     saveConfiguration()
