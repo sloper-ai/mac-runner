@@ -1344,9 +1344,8 @@ class RunnerManager: ObservableObject {
 
         do {
             try await startRunner(id)
-            if let runner = runners.first(where: { $0.id == id }) {
-                logRunnerEvent(for: runner, message: "Resumed after auto-pause.")
-            }
+            guard let runner = runners.first(where: { $0.id == id }), runner.status == .running else { return false }
+            logRunnerEvent(for: runner, message: "Resumed after auto-pause.")
             return true
         } catch {
             if let refreshedIndex = runners.firstIndex(where: { $0.id == id }) {
@@ -1393,6 +1392,7 @@ class RunnerManager: ObservableObject {
 
     /// Short status for a runner's auto-pause state, for the runner list.
     func autoPauseStatus(for runner: Runner, now: Date = Date()) -> String? {
+        if let reason = runner.storageBlockedReason { return "Waiting for storage: " + reason }
         if runner.status == .paused, let reason = runner.autoPauseReason {
             switch reason {
             case .lowBattery:
@@ -3158,7 +3158,7 @@ class RunnerManager: ObservableObject {
             try await stopRunner(id)
             try await startRunner(id)
 
-            if let refreshedIndex = runners.firstIndex(where: { $0.id == id }) {
+            if let refreshedIndex = runners.firstIndex(where: { $0.id == id }), runners[refreshedIndex].storageBlockedReason == nil {
                 runners[refreshedIndex].lastRestartEvent = "Runner restarted to apply current Homebrew tool paths."
                 logRunnerEvent(for: runners[refreshedIndex], message: runners[refreshedIndex].lastRestartEvent ?? "")
                 saveConfiguration()
