@@ -1,3 +1,10 @@
+# [1.27.0](https://github.com/sloper-ai/mac-runner/compare/v1.26.0...v1.27.0) (2026-10-09)
+
+
+### Features
+
+* maintain runner storage between jobs and enforce disk reserves ([#4](https://github.com/sloper-ai/mac-runner/issues/4)) ([d0d8438](https://github.com/sloper-ai/mac-runner/commit/d0d84389918d3e0fe6ce2909b5f0915f1ec5e794))
+
 # [1.26.0](https://github.com/sloper-ai/mac-runner/compare/v1.25.1...v1.26.0) (2026-10-08)
 
 
