@@ -5,7 +5,7 @@ import XCTest
 final class StartupRecoveryTests: XCTestCase {
     func testRunnerStartedElsewhereKeepsItsLiveState() async {
         var runner = Runner(name: "jit", repo: "example", scope: .org, status: .running, jit: true)
-        let failure = await RunnerStartupRecovery.failure {
+        let failure = await RunnerStartupRecovery.failure(isJIT: true) {
             // The CLI publishes its registration between the launch snapshot
             // and the app checking the live PID in startRunner.
             runner.githubRunnerId = 42
@@ -22,7 +22,7 @@ final class StartupRecoveryTests: XCTestCase {
 
     func testStartOwnedByAnotherProcessRemainsWanted() async {
         var runner = Runner(name: "jit", repo: "example", status: .running, jit: true)
-        let failure = await RunnerStartupRecovery.failure {
+        let failure = await RunnerStartupRecovery.failure(isJIT: true) {
             throw RunnerError.startInProgress
         }
         if failure != nil { runner.status = .error }
@@ -32,12 +32,22 @@ final class StartupRecoveryTests: XCTestCase {
     }
 
     func testGenuineLaunchFailureStillReachesErrorHandling() async {
-        let failure = await RunnerStartupRecovery.failure {
+        let failure = await RunnerStartupRecovery.failure(isJIT: true) {
             throw RunnerError.startFailed
         }
 
         guard case .startFailed = failure as? RunnerError else {
             return XCTFail("The original launch failure must be reported")
+        }
+    }
+
+    func testBlockedStartWithoutJITSupervisionStillReportsFailure() async {
+        let failure = await RunnerStartupRecovery.failure(isJIT: false) {
+            throw RunnerError.startInProgress
+        }
+
+        guard case .startInProgress = failure as? RunnerError else {
+            return XCTFail("A runner without JIT supervision must report the blocked start")
         }
     }
 }

@@ -3,7 +3,7 @@ import Foundation
 /// Startup recovery can race a CLI start after the app's launch snapshot.
 @MainActor
 enum RunnerStartupRecovery {
-    static func failure(start: () async throws -> Void) async -> Error? {
+    static func failure(isJIT: Bool, start: () async throws -> Void) async -> Error? {
         do {
             try await start()
             return nil
@@ -11,7 +11,7 @@ enum RunnerStartupRecovery {
             // startRunner reloaded the other process's published state before
             // checking its live PID. Keep that state and supervise its exit.
             return nil
-        } catch RunnerError.startInProgress {
+        } catch RunnerError.startInProgress where isJIT {
             // Another start still owns startup coordination. The supervisor
             // follows its result once it releases the lock.
             return nil
