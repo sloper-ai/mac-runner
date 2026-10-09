@@ -38,12 +38,26 @@ struct DeclarativeConfig: Codable, Equatable {
         var quietHours: QuietHoursSpec?
         var pauseOnBattery: Bool?
         var batteryThreshold: Int?
+        var automaticDiskCleanup: Bool?
+        var minimumFreeDiskSpaceGB: Int?
+        var minimumGuestFreeDiskSpaceGB: Int?
+        var cacheMaxAgeDays: Int?
+        var maxCacheSizeGB: Int?
+        var maxDockerDataSizeGB: Int?
+        var dailyVMTrim: Bool?
 
         enum CodingKeys: String, CodingKey {
             case isolation
             case quietHours = "quiet-hours"
             case pauseOnBattery = "pause-on-battery"
             case batteryThreshold = "battery-threshold"
+            case automaticDiskCleanup = "automatic-disk-cleanup"
+            case minimumFreeDiskSpaceGB = "minimum-free-disk-space-gb"
+            case minimumGuestFreeDiskSpaceGB = "minimum-guest-free-disk-space-gb"
+            case cacheMaxAgeDays = "cache-max-age-days"
+            case maxCacheSizeGB = "max-cache-size-gb"
+            case maxDockerDataSizeGB = "max-docker-data-size-gb"
+            case dailyVMTrim = "daily-vm-trim"
         }
     }
 
@@ -191,7 +205,7 @@ struct DeclarativeConfig: Codable, Equatable {
         }
         try check(root, allowed: ["version", "settings", "runners"], context: "")
         if let settings = root["settings"] as? [String: Any] {
-            try check(settings, allowed: ["isolation", "quiet-hours", "pause-on-battery", "battery-threshold"], context: " in settings")
+            try check(settings, allowed: ["isolation", "quiet-hours", "pause-on-battery", "battery-threshold", "automatic-disk-cleanup", "minimum-free-disk-space-gb", "minimum-guest-free-disk-space-gb", "cache-max-age-days", "max-cache-size-gb", "max-docker-data-size-gb", "daily-vm-trim"], context: " in settings")
         }
         for (index, runner) in ((root["runners"] as? [Any]) ?? []).enumerated() {
             guard let runner = runner as? [String: Any] else { continue }
@@ -403,6 +417,25 @@ struct DeclarativeConfig: Codable, Equatable {
             }
             result.batteryPauseThreshold = threshold
         }
+        if let value = settings.automaticDiskCleanup { result.automaticDiskCleanupEnabled = value }
+        if let value = settings.dailyVMTrim { result.storageMaintenance.dailyVMTrimEnabled = value }
+        func size(_ value: Int?, _ key: String, _ current: Int) throws -> Int {
+            guard let value else { return current }
+            guard StorageMaintenanceSettings.sizeRange.contains(value) else {
+                throw DeclarativeConfigError.invalid("settings: \(key) must be 1-100000 GB")
+            }
+            return value
+        }
+        result.minimumFreeDiskSpaceGB = try size(settings.minimumFreeDiskSpaceGB, "minimum-free-disk-space-gb", result.minimumFreeDiskSpaceGB)
+        result.storageMaintenance.minimumGuestFreeDiskSpaceGB = try size(settings.minimumGuestFreeDiskSpaceGB, "minimum-guest-free-disk-space-gb", result.storageMaintenance.minimumGuestFreeDiskSpaceGB)
+        result.storageMaintenance.maxCacheSizeGB = try size(settings.maxCacheSizeGB, "max-cache-size-gb", result.storageMaintenance.maxCacheSizeGB)
+        result.storageMaintenance.maxDockerDataSizeGB = try size(settings.maxDockerDataSizeGB, "max-docker-data-size-gb", result.storageMaintenance.maxDockerDataSizeGB)
+        if let days = settings.cacheMaxAgeDays {
+            guard StorageMaintenanceSettings.ageRange.contains(days) else {
+                throw DeclarativeConfigError.invalid("settings: cache-max-age-days must be 1-365")
+            }
+            result.storageMaintenance.cacheMaxAgeDays = days
+        }
         return result
     }
 
@@ -416,7 +449,14 @@ struct DeclarativeConfig: Codable, Equatable {
                 isolation: isolationName(settings.isolationMode) ?? "none",
                 quietHours: settings.quietHours.map(QuietHoursSpec.init),
                 pauseOnBattery: settings.pauseOnBattery,
-                batteryThreshold: settings.batteryPauseThreshold
+                batteryThreshold: settings.batteryPauseThreshold,
+                automaticDiskCleanup: settings.automaticDiskCleanupEnabled,
+                minimumFreeDiskSpaceGB: settings.minimumFreeDiskSpaceGB,
+                minimumGuestFreeDiskSpaceGB: settings.storageMaintenance.minimumGuestFreeDiskSpaceGB,
+                cacheMaxAgeDays: settings.storageMaintenance.cacheMaxAgeDays,
+                maxCacheSizeGB: settings.storageMaintenance.maxCacheSizeGB,
+                maxDockerDataSizeGB: settings.storageMaintenance.maxDockerDataSizeGB,
+                dailyVMTrim: settings.storageMaintenance.dailyVMTrimEnabled
             ),
             runners: runners.sorted { $0.name < $1.name }.map { runner in
                 RunnerSpec(
@@ -660,6 +700,15 @@ enum ConfigPlanner {
         }
         if old.batteryPauseThreshold != new.batteryPauseThreshold {
             changes.append("battery-threshold → \(new.batteryPauseThreshold)%")
+        }
+        if old.automaticDiskCleanupEnabled != new.automaticDiskCleanupEnabled {
+            changes.append("automatic-disk-cleanup → \(new.automaticDiskCleanupEnabled)")
+        }
+        if old.minimumFreeDiskSpaceGB != new.minimumFreeDiskSpaceGB {
+            changes.append("minimum-free-disk-space-gb → \(new.minimumFreeDiskSpaceGB)")
+        }
+        if old.storageMaintenance != new.storageMaintenance {
+            changes.append("storage maintenance limits or daily VM TRIM changed")
         }
         return changes
     }

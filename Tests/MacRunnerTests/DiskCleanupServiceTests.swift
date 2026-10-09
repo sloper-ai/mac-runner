@@ -15,7 +15,7 @@ final class DiskCleanupServiceTests: XCTestCase {
     }
 
     func testDryRunReportsSharedCacheWithoutRemovingIt() throws {
-        let cacheFile = temporaryDirectory.appendingPathComponent(".cache/tool/artifact.bin")
+        let cacheFile = temporaryDirectory.appendingPathComponent(".cache/pip/artifact.bin")
         try FileManager.default.createDirectory(
             at: cacheFile.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -31,7 +31,7 @@ final class DiskCleanupServiceTests: XCTestCase {
 
         XCTAssertGreaterThan(report.reclaimedBytes, 0)
         XCTAssertEqual(report.removedPaths.count, 1)
-        XCTAssertTrue(report.removedPaths[0].hasSuffix("/.cache/tool"))
+        XCTAssertTrue(report.removedPaths[0].hasSuffix("/.cache/pip/artifact.bin"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: cacheFile.path))
     }
 
@@ -58,7 +58,7 @@ final class DiskCleanupServiceTests: XCTestCase {
     }
 
     func testActiveRunnerPreservesSharedCaches() throws {
-        let cacheFile = temporaryDirectory.appendingPathComponent(".cache/tool/artifact.bin")
+        let cacheFile = temporaryDirectory.appendingPathComponent(".cache/pip/artifact.bin")
         try FileManager.default.createDirectory(
             at: cacheFile.deletingLastPathComponent(),
             withIntermediateDirectories: true

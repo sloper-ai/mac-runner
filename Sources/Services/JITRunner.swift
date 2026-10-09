@@ -111,7 +111,7 @@ enum JITRunner {
         let directory = runnerDirectory.hasSuffix("/") ? String(runnerDirectory.dropLast()) : runnerDirectory
         let work = quoted(directory + "/_work")
         // Jobs can leave read-only directories (Go's module cache, say), which rm can't empty.
-        let reset = "{ chmod -R u+w \(work) 2>/dev/null || true; } && rm -rf \(work) && rm -f "
+        let reset = "{ chmod -R -P u+w \(work) 2>/dev/null || true; } && rm -rf \(work) && rm -f "
             + credentialFileNames.map { quoted(directory + "/" + $0) }.joined(separator: " ")
         guard let configFile else { return reset }
         let file = quoted(configFile)
@@ -206,7 +206,7 @@ final class RunnerStartLock {
     }
 
     static func tryAcquire(path: String) -> RunnerStartLock? {
-        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
+        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o644)
         guard fd >= 0 else { return nil }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
             close(fd)

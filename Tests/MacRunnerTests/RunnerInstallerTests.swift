@@ -170,7 +170,9 @@ final class ServiceUserLogCommandTests: XCTestCase {
         let result = try ProcessExecutor.run("/bin/bash", arguments: ["-c", command + " && ls -le " + "'\(log)'"])
 
         XCTAssertTrue(result.succeeded, result.output)
-        XCTAssertTrue(result.output.contains("-rw-r--r--+"), result.output)
+        // ls displays @ instead of + when the file has extended attributes too.
+        let permissions = try FileManager.default.attributesOfItem(atPath: log)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(permissions?.intValue, 0o644)
         XCTAssertTrue(result.output.contains("user:\(NSUserName()) allow write,append"), result.output)
     }
 }

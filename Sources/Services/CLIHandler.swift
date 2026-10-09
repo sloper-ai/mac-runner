@@ -485,6 +485,10 @@ enum CLIHandler {
         print("Starting runner '\(name)'...")
         do {
             try await manager.startRunner(runner.id)
+            if let reason = manager.runner(named: name)?.storageBlockedReason {
+                print("Runner '\(name)' is waiting for storage: \(reason) The app will retry every minute.")
+                return
+            }
             print("Runner '\(name)' started.")
             if let started = manager.runner(named: name), started.isJIT {
                 for note in jitNotes(for: started, appIsRunning: menuBarAppIsRunning()) {
@@ -546,6 +550,9 @@ enum CLIHandler {
         let authenticated = await GHCLIService.shared.checkAuth()
         print("  GitHub auth: \(authenticated ? "authenticated" : "not authenticated")")
 
+        for runner in manager.runners where runner.storageBlockedReason != nil {
+            print("\(runner.name): waiting for storage — \(runner.storageBlockedReason ?? "")")
+        }
         for line in autoPauseStatusLines(manager: manager) {
             print("  \(line)")
         }
@@ -895,6 +902,9 @@ enum CLIHandler {
             }
         }
 
+        for runner in manager.runners where runner.storageBlockedReason != nil {
+            print("\(runner.name): waiting for storage — \(runner.storageBlockedReason ?? "")")
+        }
         for line in autoPauseStatusLines(manager: manager) {
             print(line)
         }
@@ -1151,6 +1161,10 @@ enum CLIHandler {
         let dryRun = args.contains("--dry-run")
         let includeSharedCaches = !args.contains("--workspaces-only")
         do {
+            guard let lock = await StorageMaintenanceService.acquireAdmissionLock() else {
+                throw StorageMaintenanceError(message: "A runner start or maintenance is still in progress. Retry later.")
+            }
+            defer { lock.unlock() }
             let config = try ConfigService().loadConfig()
             let report = try DiskCleanupService().cleanup(
                 runners: config.runners,

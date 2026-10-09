@@ -20,8 +20,9 @@ struct DiskCleanupService {
     }
 
     func availableDiskBytes() -> Int64? {
-        let values = try? homeDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return values?.volumeAvailableCapacityForImportantUsage
+        // Use available blocks, excluding speculative purgeable capacity.
+        let values = try? homeDirectory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+        return values?.volumeAvailableCapacity.map(Int64.init)
     }
 
     func cleanup(
@@ -34,7 +35,7 @@ struct DiskCleanupService {
         var skipped: [String] = []
 
         for runner in runners {
-            guard runner.status != .running && !runner.busy else {
+            guard runner.status != .running && !runner.busy && !PIDFileManager().isRunnerProcessAlive(runner.id) else {
                 skipped.append(runner.name)
                 continue
             }
@@ -57,7 +58,7 @@ struct DiskCleanupService {
 
         var reclaimedBytes: Int64 = 0
         var removedPaths: [String] = []
-        for directory in candidates where fileManager.fileExists(atPath: directory.path) {
+        for directory in candidates where DisposableCache.safeDirectory(directory, under: homeDirectory.resolvingSymlinksInPath()) {
             let children = (try? fileManager.contentsOfDirectory(
                 at: directory,
                 includingPropertiesForKeys: nil,
@@ -82,21 +83,16 @@ struct DiskCleanupService {
     }
 
     private func sharedCICacheDirectories() -> [URL] {
-        [
-            homeDirectory.appendingPathComponent(".cache", isDirectory: true),
-            homeDirectory.appendingPathComponent(".npm/_cacache", isDirectory: true),
-            homeDirectory.appendingPathComponent(".npm/_npx", isDirectory: true),
-            homeDirectory.appendingPathComponent(".cargo/registry/cache", isDirectory: true),
-            homeDirectory.appendingPathComponent(".cargo/git", isDirectory: true),
-            homeDirectory.appendingPathComponent(".gradle/caches", isDirectory: true),
-            homeDirectory.appendingPathComponent("Library/Caches/Homebrew", isDirectory: true),
-            homeDirectory.appendingPathComponent("Library/Caches/go-build", isDirectory: true),
-            homeDirectory.appendingPathComponent("Library/Caches/org.swift.swiftpm", isDirectory: true),
-            homeDirectory.appendingPathComponent("Library/Developer/Xcode/DerivedData", isDirectory: true)
-        ]
+        DisposableCache.relativePaths.map { homeDirectory.appendingPathComponent($0, isDirectory: true) }
     }
 
     private func allocatedSize(of url: URL) -> Int64 {
+        let type = (try? fileManager.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType
+        if type == .typeSymbolicLink { return 0 }
+        if type == .typeRegular {
+            let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+            return Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? 0)
+        }
         guard let enumerator = fileManager.enumerator(
             at: url,
             includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey],

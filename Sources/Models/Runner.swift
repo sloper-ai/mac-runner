@@ -31,6 +31,8 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     var isolationMode: IsolationMode?  // Per-runner isolation override (nil = use global setting)
     var enableGUI: Bool  // Whether to enable GUI access for this runner (default: false, headless)
     var lastRestartEvent: String?
+    /// Waiting before registration; the app retries without consuming crash retries.
+    var storageBlockedReason: String?
     var openFileLimit: Int?  // Per-runner override for max open files (nil = use global setting)
     var quietHours: QuietHours?  // Per-runner pause schedule (nil = use global setting)
     var autoPauseReason: AutoPauseReason?  // Set while Mac Runner has paused this runner automatically
@@ -134,6 +136,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         // Default GUI access to false (headless) for backward compatibility
         enableGUI = try container.decodeIfPresent(Bool.self, forKey: .enableGUI) ?? false
         // Default restart event to nil for backward compatibility
+        storageBlockedReason = try container.decodeIfPresent(String.self, forKey: .storageBlockedReason)
         lastRestartEvent = try container.decodeIfPresent(String.self, forKey: .lastRestartEvent)
         openFileLimit = ResourceLimits.normalizedOpenFileLimit(
             try container.decodeIfPresent(Int.self, forKey: .openFileLimit)
@@ -220,14 +223,16 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
 
     /// Persisted run state, compared when reconciling concurrent config edits.
     struct PersistedState: Equatable {
+        var storageBlockedReason: String?
         var status: RunnerStatus
         var autoPauseReason: AutoPauseReason?
         var autoPauseOverride: AutoPauseReason?
     }
 
     var persistedState: PersistedState {
-        get { PersistedState(status: status, autoPauseReason: autoPauseReason, autoPauseOverride: autoPauseOverride) }
+        get { PersistedState(storageBlockedReason: storageBlockedReason, status: status, autoPauseReason: autoPauseReason, autoPauseOverride: autoPauseOverride) }
         set {
+            storageBlockedReason = newValue.storageBlockedReason
             status = newValue.status
             autoPauseReason = newValue.autoPauseReason
             autoPauseOverride = newValue.autoPauseOverride
@@ -502,6 +507,7 @@ struct AppSettings: Codable, Sendable, Equatable {
     var autoRestartMaxRetries: Int
     var automaticDiskCleanupEnabled: Bool
     var minimumFreeDiskSpaceGB: Int
+    var storageMaintenance: StorageMaintenanceSettings
     var openFileLimit: Int
     var resourceAlerts: ResourceAlertSettings
 
@@ -542,6 +548,7 @@ struct AppSettings: Codable, Sendable, Equatable {
         autoRestartMaxRetries: Int = 5,
         automaticDiskCleanupEnabled: Bool = false,
         minimumFreeDiskSpaceGB: Int = 100,
+        storageMaintenance: StorageMaintenanceSettings = .default,
         openFileLimit: Int = ResourceLimits.defaultOpenFileLimit,
         resourceAlerts: ResourceAlertSettings = .default
     ) {
@@ -556,7 +563,8 @@ struct AppSettings: Codable, Sendable, Equatable {
         self.autoRestartEnabled = autoRestartEnabled
         self.autoRestartMaxRetries = max(1, autoRestartMaxRetries)
         self.automaticDiskCleanupEnabled = automaticDiskCleanupEnabled
-        self.minimumFreeDiskSpaceGB = max(1, minimumFreeDiskSpaceGB)
+        self.minimumFreeDiskSpaceGB = StorageMaintenanceSettings.size(minimumFreeDiskSpaceGB)
+        self.storageMaintenance = storageMaintenance
         self.openFileLimit = ResourceLimits.normalizedOpenFileLimit(openFileLimit) ?? ResourceLimits.defaultOpenFileLimit
         self.resourceAlerts = resourceAlerts
     }
@@ -576,7 +584,8 @@ struct AppSettings: Codable, Sendable, Equatable {
         autoRestartEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoRestartEnabled) ?? true
         autoRestartMaxRetries = max(1, try container.decodeIfPresent(Int.self, forKey: .autoRestartMaxRetries) ?? 5)
         automaticDiskCleanupEnabled = try container.decodeIfPresent(Bool.self, forKey: .automaticDiskCleanupEnabled) ?? false
-        minimumFreeDiskSpaceGB = max(1, try container.decodeIfPresent(Int.self, forKey: .minimumFreeDiskSpaceGB) ?? 100)
+        minimumFreeDiskSpaceGB = StorageMaintenanceSettings.size(try container.decodeIfPresent(Int.self, forKey: .minimumFreeDiskSpaceGB) ?? 100)
+        storageMaintenance = try container.decodeIfPresent(StorageMaintenanceSettings.self, forKey: .storageMaintenance) ?? .default
         openFileLimit = ResourceLimits.normalizedOpenFileLimit(
             try container.decodeIfPresent(Int.self, forKey: .openFileLimit)
         ) ?? ResourceLimits.defaultOpenFileLimit
