@@ -21,8 +21,10 @@ struct DiskCleanupService {
 
     func availableDiskBytes() -> Int64? {
         // Use available blocks, excluding speculative purgeable capacity.
-        let values = try? homeDirectory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-        return values?.volumeAvailableCapacity.map(Int64.init)
+        // Query the filesystem directly: a long-lived URL can cache capacity
+        // from before a job consumed space, even across admission checks.
+        let attributes = try? fileManager.attributesOfFileSystem(forPath: homeDirectory.path)
+        return (attributes?[.systemFreeSize] as? NSNumber)?.int64Value
     }
 
     func cleanup(
