@@ -20,7 +20,7 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
     func testCacheAgeAndBudgetPreserveBrowsersToolsAndCredentials() throws {
         let home = try scratch()
         defer { try? FileManager.default.removeItem(at: home) }
-        let old = try file(".npm/_cacache/stale", in: home, age: 9 * 86400)
+        let old = try file(".cargo/registry/src/stale", in: home, age: 9 * 86400)
         let fresh = try file(".cache/pip/fresh", in: home, bytes: 300)
         let protected = try [".cache/ms-playwright/chromium/browser", "Library/Caches/ms-playwright/firefox/browser",
             ".cache/unknown/toolchain", ".rustup/toolchains/stable/rustc", ".cargo/bin/cargo", ".ssh/key",
@@ -171,7 +171,7 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
 
     func testOnlyKnownCacheSubpathsAndLocalColimaEndpointsAreAccepted() {
         XCTAssertEqual(DisposableCache.paths(inMount: "/root/.npm"), ["_cacache", "_logs", "_npx"])
-        XCTAssertEqual(DisposableCache.paths(inMount: "/home/runner/.cargo/registry"), ["cache"])
+        XCTAssertEqual(DisposableCache.paths(inMount: "/home/runner/.cargo/registry"), ["cache", "index", "src"])
         XCTAssertTrue(DisposableCache.paths(inMount: "/root/.cache/ms-playwright").isEmpty)
         XCTAssertTrue(DisposableCache.paths(inMount: "/root/unknown").isEmpty)
         let home = URL(fileURLWithPath: "/Users/ci")

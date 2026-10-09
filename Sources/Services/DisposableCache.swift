@@ -6,7 +6,7 @@ enum DisposableCache {
     static let relativePaths = [
         ".npm/_cacache", ".npm/_npx", ".npm/_logs",
         ".cache/pip", ".cache/uv", ".cache/go-build", ".cache/sccache",
-        ".cargo/registry/cache", ".cargo/git/db", ".cargo/git/checkouts",
+        ".cargo/registry/cache", ".cargo/registry/index", ".cargo/registry/src", ".cargo/git/db", ".cargo/git/checkouts",
         ".gradle/caches", "Library/Caches/Homebrew", "Library/Caches/go-build",
         "Library/Caches/org.swift.swiftpm", "Library/Caches/pip", "Library/Caches/uv",
         "Library/Developer/Xcode/DerivedData"
