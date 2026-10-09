@@ -242,7 +242,7 @@ struct StorageMaintenanceService: Sendable {
         guard let result = await execute(colima, ["--profile", profile, "ssh", "--", "sudo", "-n", "env", "LC_ALL=C", "fstrim", "-av"], 120), result.succeeded else {
             return ["VM TRIM failed or is unsupported by the guest; retrying in an hour."]
         }
-        guard result.output.contains("bytes trimmed") else {
+        guard result.output.contains(" bytes) trimmed") else {
             return ["VM TRIM reported no discard-capable filesystem; retrying in an hour."]
         }
         do { try writeDate(now, to: success) } catch { return ["VM TRIM succeeded, but saving its date failed: \(error.localizedDescription)"] }

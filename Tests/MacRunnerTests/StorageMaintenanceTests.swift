@@ -234,7 +234,7 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
             if args.contains("status") {
                 return .init(terminationStatus: 0, output: "{\"runtime\":\"docker\",\"docker_socket\":\"\(endpoint)\"}")
             }
-            return .init(terminationStatus: succeeds ? 0 : 1, output: succeeds ? "/var/lib/docker: 123 bytes trimmed" : "unsupported")
+            return .init(terminationStatus: succeeds ? 0 : 1, output: succeeds ? "/var/lib/docker: 123 B (123 bytes) trimmed on /dev/vdb1" : "unsupported")
         }
     }
 
