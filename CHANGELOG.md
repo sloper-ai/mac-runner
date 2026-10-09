@@ -1,3 +1,10 @@
+## [1.27.1](https://github.com/sloper-ai/mac-runner/compare/v1.27.0...v1.27.1) (2026-10-09)
+
+
+### Bug Fixes
+
+* refresh host disk capacity before storage checks ([#6](https://github.com/sloper-ai/mac-runner/issues/6)) ([90d40b7](https://github.com/sloper-ai/mac-runner/commit/90d40b715966eb68b621732dd6aa5c136c080bd5))
+
 # [1.27.0](https://github.com/sloper-ai/mac-runner/compare/v1.26.0...v1.27.0) (2026-10-09)
 
 
