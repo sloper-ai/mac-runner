@@ -1,3 +1,10 @@
+## [1.27.2](https://github.com/sloper-ai/mac-runner/compare/v1.27.1...v1.27.2) (2026-10-09)
+
+
+### Bug Fixes
+
+* preserve runners started during app launch ([f6a4565](https://github.com/sloper-ai/mac-runner/commit/f6a4565f0b363d7d7cda2a0e07cca6a0ebfe0228))
+
 ## [1.27.1](https://github.com/sloper-ai/mac-runner/compare/v1.27.0...v1.27.1) (2026-10-09)
 
 
