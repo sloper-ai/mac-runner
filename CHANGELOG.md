@@ -1,3 +1,10 @@
+# [1.28.0](https://github.com/sloper-ai/mac-runner/compare/v1.27.2...v1.28.0) (2026-10-11)
+
+
+### Features
+
+* trim the Colima VM disk every 10 minutes and under disk pressure ([#10](https://github.com/sloper-ai/mac-runner/issues/10)) ([6414c5a](https://github.com/sloper-ai/mac-runner/commit/6414c5ade35eb78902f29587aabb576aaa5b0416))
+
 ## [1.27.2](https://github.com/sloper-ai/mac-runner/compare/v1.27.1...v1.27.2) (2026-10-09)
 
 
