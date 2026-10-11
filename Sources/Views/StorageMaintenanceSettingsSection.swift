@@ -24,7 +24,7 @@ struct StorageMaintenanceSettingsSection: View {
                     value: binding(\.maxDockerDataSizeGB), in: 1...500)
             Stepper("Cache retention: \(runnerManager.currentSettings.storageMaintenance.cacheMaxAgeDays) days",
                     value: binding(\.cacheMaxAgeDays), in: 1...365)
-            Toggle("Trim Supported Local VM Disks Daily", isOn: Binding(
+            Toggle("Trim Supported Local VM Disks", isOn: Binding(
                 get: { runnerManager.currentSettings.storageMaintenance.dailyVMTrimEnabled },
                 set: { value in
                     var settings = runnerManager.currentSettings
@@ -32,6 +32,9 @@ struct StorageMaintenanceSettingsSection: View {
                     runnerManager.updateSettings(settings)
                 }
             ))
+            Stepper("VM TRIM interval: \(runnerManager.currentSettings.storageMaintenance.vmTrimIntervalMinutes) minutes",
+                    value: binding(\.vmTrimIntervalMinutes), in: StorageMaintenanceSettings.trimIntervalRange)
+                .disabled(!runnerManager.currentSettings.storageMaintenance.dailyVMTrimEnabled)
         }
     }
 }
