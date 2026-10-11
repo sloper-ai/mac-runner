@@ -7,11 +7,15 @@ struct StorageMaintenanceSettings: Codable, Sendable, Equatable {
     var cacheMaxAgeDays: Int = 7
     var maxCacheSizeGB: Int = 10
     var maxDockerDataSizeGB: Int = 15
+    /// Turns VM TRIM on or off. The name and the `daily-vm-trim` key predate `vmTrimIntervalMinutes`.
     var dailyVMTrimEnabled: Bool = true
+    /// Minutes between VM TRIMs. Jobs free tens of GB inside the VM, which the Mac gets back only through TRIM.
+    var vmTrimIntervalMinutes: Int = 10
 
     static let `default` = StorageMaintenanceSettings()
     static let sizeRange = 1...100_000
     static let ageRange = 1...365
+    static let trimIntervalRange = 1...1440
 
     init() {}
 
@@ -22,6 +26,8 @@ struct StorageMaintenanceSettings: Codable, Sendable, Equatable {
         maxCacheSizeGB = Self.size(try values.decodeIfPresent(Int.self, forKey: .maxCacheSizeGB) ?? 10)
         maxDockerDataSizeGB = Self.size(try values.decodeIfPresent(Int.self, forKey: .maxDockerDataSizeGB) ?? 15)
         dailyVMTrimEnabled = try values.decodeIfPresent(Bool.self, forKey: .dailyVMTrimEnabled) ?? true
+        vmTrimIntervalMinutes = min(max(try values.decodeIfPresent(Int.self, forKey: .vmTrimIntervalMinutes) ?? 10,
+                                        Self.trimIntervalRange.lowerBound), Self.trimIntervalRange.upperBound)
     }
 
     static func size(_ value: Int) -> Int { min(max(value, 1), sizeRange.upperBound) }

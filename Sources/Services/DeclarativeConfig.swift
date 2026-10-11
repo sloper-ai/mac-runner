@@ -45,6 +45,7 @@ struct DeclarativeConfig: Codable, Equatable {
         var maxCacheSizeGB: Int?
         var maxDockerDataSizeGB: Int?
         var dailyVMTrim: Bool?
+        var vmTrimIntervalMinutes: Int?
 
         enum CodingKeys: String, CodingKey {
             case isolation
@@ -58,6 +59,7 @@ struct DeclarativeConfig: Codable, Equatable {
             case maxCacheSizeGB = "max-cache-size-gb"
             case maxDockerDataSizeGB = "max-docker-data-size-gb"
             case dailyVMTrim = "daily-vm-trim"
+            case vmTrimIntervalMinutes = "vm-trim-interval-minutes"
         }
     }
 
@@ -205,7 +207,7 @@ struct DeclarativeConfig: Codable, Equatable {
         }
         try check(root, allowed: ["version", "settings", "runners"], context: "")
         if let settings = root["settings"] as? [String: Any] {
-            try check(settings, allowed: ["isolation", "quiet-hours", "pause-on-battery", "battery-threshold", "automatic-disk-cleanup", "minimum-free-disk-space-gb", "minimum-guest-free-disk-space-gb", "cache-max-age-days", "max-cache-size-gb", "max-docker-data-size-gb", "daily-vm-trim"], context: " in settings")
+            try check(settings, allowed: ["isolation", "quiet-hours", "pause-on-battery", "battery-threshold", "automatic-disk-cleanup", "minimum-free-disk-space-gb", "minimum-guest-free-disk-space-gb", "cache-max-age-days", "max-cache-size-gb", "max-docker-data-size-gb", "daily-vm-trim", "vm-trim-interval-minutes"], context: " in settings")
         }
         for (index, runner) in ((root["runners"] as? [Any]) ?? []).enumerated() {
             guard let runner = runner as? [String: Any] else { continue }
@@ -436,6 +438,12 @@ struct DeclarativeConfig: Codable, Equatable {
             }
             result.storageMaintenance.cacheMaxAgeDays = days
         }
+        if let minutes = settings.vmTrimIntervalMinutes {
+            guard StorageMaintenanceSettings.trimIntervalRange.contains(minutes) else {
+                throw DeclarativeConfigError.invalid("settings: vm-trim-interval-minutes must be 1-1440")
+            }
+            result.storageMaintenance.vmTrimIntervalMinutes = minutes
+        }
         return result
     }
 
@@ -456,7 +464,8 @@ struct DeclarativeConfig: Codable, Equatable {
                 cacheMaxAgeDays: settings.storageMaintenance.cacheMaxAgeDays,
                 maxCacheSizeGB: settings.storageMaintenance.maxCacheSizeGB,
                 maxDockerDataSizeGB: settings.storageMaintenance.maxDockerDataSizeGB,
-                dailyVMTrim: settings.storageMaintenance.dailyVMTrimEnabled
+                dailyVMTrim: settings.storageMaintenance.dailyVMTrimEnabled,
+                vmTrimIntervalMinutes: settings.storageMaintenance.vmTrimIntervalMinutes
             ),
             runners: runners.sorted { $0.name < $1.name }.map { runner in
                 RunnerSpec(
@@ -708,7 +717,7 @@ enum ConfigPlanner {
             changes.append("minimum-free-disk-space-gb → \(new.minimumFreeDiskSpaceGB)")
         }
         if old.storageMaintenance != new.storageMaintenance {
-            changes.append("storage maintenance limits or daily VM TRIM changed")
+            changes.append("storage maintenance limits or VM TRIM changed")
         }
         return changes
     }

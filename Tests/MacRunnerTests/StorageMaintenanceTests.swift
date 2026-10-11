@@ -201,6 +201,8 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
         let partial = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"storageMaintenance":{"maxCacheSizeGB":5}}"#.utf8))
         XCTAssertEqual(partial.storageMaintenance.maxCacheSizeGB, 5)
         XCTAssertEqual(partial.storageMaintenance.minimumGuestFreeDiskSpaceGB, 10)
+        XCTAssertEqual(partial.storageMaintenance.vmTrimIntervalMinutes, 10)
+        XCTAssertEqual(try JSONDecoder().decode(StorageMaintenanceSettings.self, from: Data(#"{"vmTrimIntervalMinutes":0}"#.utf8)).vmTrimIntervalMinutes, 1)
         let yaml = """
         settings:
           automatic-disk-cleanup: true
@@ -210,14 +212,17 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
           max-cache-size-gb: 6
           max-docker-data-size-gb: 9
           daily-vm-trim: false
+          vm-trim-interval-minutes: 15
         runners: []
         """
         let settings = try DeclarativeConfig.parse(yaml).resolvedSettings(old)
         XCTAssertTrue(settings.automaticDiskCleanupEnabled)
         XCTAssertEqual(settings.storageMaintenance.minimumGuestFreeDiskSpaceGB, 12)
+        XCTAssertEqual(settings.storageMaintenance.vmTrimIntervalMinutes, 15)
         let exported = try DeclarativeConfig.export(runners: [], settings: settings).yaml()
         XCTAssertEqual(try DeclarativeConfig.parse(exported).resolvedSettings(.default), settings)
-        for pair in ["cache-max-age-days: 0", "max-cache-size-gb: -1", "minimum-guest-free-disk-space-gb: 0", "max-docker-data-size-gb: 100001"] {
+        for pair in ["cache-max-age-days: 0", "max-cache-size-gb: -1", "minimum-guest-free-disk-space-gb: 0", "max-docker-data-size-gb: 100001",
+                     "vm-trim-interval-minutes: 0", "vm-trim-interval-minutes: 1441"] {
             XCTAssertThrowsError(try DeclarativeConfig.parse("settings:\n  \(pair)\nrunners: []\n").resolvedSettings(.default))
         }
         var blocked = Runner(name: "waiting", repo: "o/r", status: .paused)
@@ -248,20 +253,51 @@ final class StorageMaintenanceTests: XCTestCase, @unchecked Sendable {
         let endpoint = "unix://" + home.path + "/.colima/default/docker.sock"
         let env = ["PATH": home.appendingPathComponent("bin").path, "DOCKER_HOST": endpoint]
         let stub = TrimStub(endpoint: endpoint)
-        let settings = AppSettings(automaticDiskCleanupEnabled: true)
+        var settings = AppSettings(automaticDiskCleanupEnabled: true)
+        settings.storageMaintenance.vmTrimIntervalMinutes = 1440
         let now = Date()
         var first = StorageMaintenanceService(home: home)
         first.execute = { await stub.run($0, $1, $2) }
+        first.hostAvailableBytes = { _ in 500_000_000_000 }
         let result = await first.trimIfDue(settings: settings, hasDockerRunners: true, now: now, environment: env)
         XCTAssertTrue(result.joined().contains("succeeded"))
         var second = StorageMaintenanceService(home: home)
         second.execute = first.execute
+        second.hostAvailableBytes = first.hostAvailableBytes
         _ = await second.trimIfDue(settings: settings, hasDockerRunners: true, now: now.addingTimeInterval(7200), environment: env)
         var calls = await stub.calls
         XCTAssertEqual(calls.filter { $0.contains("fstrim") }.count, 1)
         _ = await second.trimIfDue(settings: settings, hasDockerRunners: true, now: now.addingTimeInterval(90000), environment: env)
         calls = await stub.calls
         XCTAssertEqual(calls.filter { $0.contains("fstrim") }.count, 2)
+    }
+
+    func testTrimRunsEveryIntervalAndEveryMinuteUnderDiskPressure() async throws {
+        let home = try scratch()
+        defer { try? FileManager.default.removeItem(at: home) }
+        for name in ["docker", "colima"] {
+            let url = try file("bin/" + name, in: home)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        let endpoint = "unix://" + home.path + "/.colima/default/docker.sock"
+        let env = ["PATH": home.appendingPathComponent("bin").path, "DOCKER_HOST": endpoint]
+        let stub = TrimStub(endpoint: endpoint)
+        let settings = AppSettings(automaticDiskCleanupEnabled: true, minimumFreeDiskSpaceGB: 40)
+        let now = Date()
+        func service(freeBytes: Int64) -> StorageMaintenanceService {
+            var service = StorageMaintenanceService(home: home)
+            service.execute = { await stub.run($0, $1, $2) }
+            service.hostAvailableBytes = { _ in freeBytes }
+            return service
+        }
+        let roomy = service(freeBytes: 500_000_000_000), full = service(freeBytes: 30_000_000_000)
+        var trims: [Int] = []
+        for (service, seconds) in [(roomy, 0.0), (roomy, 300), (roomy, 601), (full, 631), (full, 662), (full, 720), (full, 723)] {
+            _ = await service.trimIfDue(settings: settings, hasDockerRunners: true, now: now.addingTimeInterval(seconds), environment: env)
+            trims.append(await stub.calls.filter { $0.contains("fstrim") }.count)
+        }
+        // Every 10 minutes by default; as often as once a minute while the Mac is below its reserve.
+        XCTAssertEqual(trims, [1, 1, 2, 2, 3, 3, 4])
     }
 
     func testRemoteDockerEndpointNeverTrimsLocalColima() async throws {

@@ -140,7 +140,8 @@ settings:
   cache-max-age-days: 7
   max-cache-size-gb: 10
   max-docker-data-size-gb: 15
-  daily-vm-trim: true
+  daily-vm-trim: true  # turns VM TRIM on or off; the name predates the interval
+  vm-trim-interval-minutes: 10
 ```
 
 The cache budget covers the combined allowlisted package caches in the native account's home, or in one Docker runner's cache volumes. These are decimal GB. A cache whose regular files have all gone seven days without a write is emptied as a unit. If the combined caches exceed the budget, they are all emptied. Whole-cache removal avoids partial npx installations and package indexes. Cache hits do not update file modification times. Both engines count allocated blocks. A running job may exceed a budget; maintenance enforces it at the next start.
@@ -153,7 +154,7 @@ Each Docker-in-Docker data volume is disposable job data. Mac Runner resets it o
 
 Mac and Docker guest reserves are checked independently after cleanup. A failed measurement or insufficient space puts the runner in **paused / waiting for storage**, before registration. The menu app retries every minute without consuming crash retries, including after app restarts. Stop the runner to cancel these retries. Running jobs continue, with pressure reported in the app's existing log; new starts wait. Lower a reserve or free space to recover. Maintenance summaries and errors appear in `runner.log`; `status` shows the waiting reason. Log rotation (10 MiB, three backups) and seven-day diagnostic retention are unchanged.
 
-With a matching local Colima socket and profile, Mac Runner runs the guest's `fstrim` once per 24 hours, retaining the successful date across app restarts and retrying failures at most hourly. This follows [Colima's documented reclamation mechanism](https://github.com/abiosoft/colima/blob/main/docs/FAQ.md). It discards only unused filesystem blocks and may run during jobs. It never stops, resizes, or rewrites the VM disk. Remote Docker endpoints and other VM backends log that TRIM is unsupported; their guest free-space checks still work. An idle app also runs daily TRIM and read-only pressure checks. Filesystem snapshots can delay physical space reclamation.
+With a matching local Colima socket and profile, Mac Runner runs the guest's `fstrim` every 10 minutes (`vm-trim-interval-minutes`, 1–1440), retaining the last success across app restarts and retrying failures after the interval or an hour, whichever is shorter. Jobs free tens of GB inside the VM, and its disk image returns that space to the Mac only through TRIM, so a long interval lets the image fill the Mac between runs. While the Mac is below its free-space reserve, TRIM runs as often as once a minute, so runners waiting for space get back what TRIM can return. This follows [Colima's documented reclamation mechanism](https://github.com/abiosoft/colima/blob/main/docs/FAQ.md). It discards only unused filesystem blocks and may run during jobs. It never stops, resizes, or rewrites the VM disk. Remote Docker endpoints and other VM backends log that TRIM is unsupported; their guest free-space checks still work. An idle app also runs TRIM and read-only pressure checks. Filesystem snapshots can delay physical space reclamation.
 
 To roll back, stop new registrations, let current jobs finish, and restore the previous app and saved configuration. Cache contents already discarded are downloaded or rebuilt by subsequent jobs.
 

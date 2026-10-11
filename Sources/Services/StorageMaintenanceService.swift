@@ -210,11 +210,16 @@ struct StorageMaintenanceService: Sendable {
         return profile
     }
 
+    /// TRIM hands the blocks a local Colima VM has freed back to APFS. Jobs free tens of GB inside the VM, so TRIM runs
+    /// every `vmTrimIntervalMinutes`, and as often as once a minute while the Mac is below its free-space reserve, where
+    /// a waiting runner may need space only TRIM returns. Failures retry after the interval or an hour, whichever is shorter.
     func trimIfDue(settings: AppSettings, hasDockerRunners: Bool, now: Date = Date(), environment: [String: String] = ProcessInfo.processInfo.environment) async -> [String] {
         guard settings.automaticDiskCleanupEnabled, settings.storageMaintenance.dailyVMTrimEnabled, hasDockerRunners,
               let docker = DockerRunnerEngine.executablePath(environment: environment, home: home) else { return [] }
+        let interval = TimeInterval(settings.storageMaintenance.vmTrimIntervalMinutes) * 60
+        let pressure = hostAvailableBytes(home).map { $0 < StorageMaintenanceSettings.bytes(settings.minimumFreeDiskSpaceGB) } ?? false
         let attempt = stateDirectory.appendingPathComponent("trim-attempt.date")
-        if let last = readDate(attempt), now.timeIntervalSince(last) < 3600 { return [] }
+        if let last = readDate(attempt), now.timeIntervalSince(last) < (pressure ? 60 : min(interval, 3600)) { return [] }
         do { try writeDate(now, to: attempt) } catch { return ["VM TRIM state error: \(error.localizedDescription)"] }
         let endpoint: String
         if environment["DOCKER_CONTEXT"]?.isEmpty != false, let host = environment["DOCKER_HOST"], !host.isEmpty {
@@ -229,7 +234,7 @@ struct StorageMaintenanceService: Sendable {
             return ["VM TRIM unsupported for this Docker endpoint; free-space admission checks remain enabled."]
         }
         let success = stateDirectory.appendingPathComponent("trim-\(profile).date")
-        if let last = readDate(success), now.timeIntervalSince(last) < 86400 { return [] }
+        if !pressure, let last = readDate(success), now.timeIntervalSince(last) < interval { return [] }
         let paths = RunnerEnvironment.normalizedPath(environment["PATH"]).split(separator: ":").map { "\($0)/colima" }
         guard let colima = paths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
               let status = await execute(colima, ["--profile", profile, "status", "--json"], 20), status.succeeded,
@@ -240,12 +245,12 @@ struct StorageMaintenanceService: Sendable {
         // fstrim only discards free filesystem blocks. It is safe with live jobs;
         // never compact, resize, stop, or rewrite a VM disk image from the host.
         guard let result = await execute(colima, ["--profile", profile, "ssh", "--", "sudo", "-n", "env", "LC_ALL=C", "fstrim", "-av"], 120), result.succeeded else {
-            return ["VM TRIM failed or is unsupported by the guest; retrying in an hour."]
+            return ["VM TRIM failed or is unsupported by the guest; retrying later."]
         }
         guard result.output.contains(" bytes) trimmed") else {
-            return ["VM TRIM reported no discard-capable filesystem; retrying in an hour."]
+            return ["VM TRIM reported no discard-capable filesystem; retrying later."]
         }
         do { try writeDate(now, to: success) } catch { return ["VM TRIM succeeded, but saving its date failed: \(error.localizedDescription)"] }
-        return ["Daily VM TRIM succeeded: " + result.output.trimmingCharacters(in: .whitespacesAndNewlines)]
+        return ["VM TRIM succeeded: " + result.output.trimmingCharacters(in: .whitespacesAndNewlines)]
     }
 }

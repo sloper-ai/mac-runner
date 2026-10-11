@@ -2391,7 +2391,7 @@ class RunnerManager: ObservableObject {
         }
     }
 
-    /// The app owns retries and daily VM TRIM. CLI instances do preflight only.
+    /// The app owns retries and periodic VM TRIM. CLI instances do preflight only.
     private func runStorageMaintenanceIfNeeded(now: Date = Date()) {
         guard automationEnabled, storageMaintenanceTask == nil else { return }
         if let last = lastStorageMaintenanceCheck, now.timeIntervalSince(last) < 60 { return }
