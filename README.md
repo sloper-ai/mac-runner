@@ -28,7 +28,7 @@ Simple Mac menu bar app and CLI for managing GitHub Actions self-hosted runners.
 - 📦 **Custom container images**: run Linux runners on your own OCI images (linux/arm64 with `bash`; see [Container Isolation](#3-container-isolation-linux-runners) for requirements), each with its own virtual display when GUI access is on
 - 🐳 **Docker engine**: run Linux container runners in Docker (Docker Desktop, OrbStack, Colima) instead of Apple's Containerization, with local images and the work directory in a Docker volume; set each container's CPUs and memory on either engine, and give jobs Docker of their own ([Docker-in-Docker](#docker-for-jobs-docker-in-docker))
 - 🗂️ **Declarative config**: describe runners in `.mac-runner.yml` and `mac-runner apply` them (`mac-runner export` to start)
-- ♻️ **Just-in-time runners**: a single-use registration and a fresh workspace for every job, deleted afterwards, with optional cache volumes that outlive them ([Just-in-time Runners](#just-in-time-runners))
+- ♻️ **Just-in-time runners**: a single-use registration and a fresh workspace for every job, deleted afterwards, with optional cache volumes that outlive them ([Just-in-time Runners](#just-in-time-runners)), and a shared [action cache](#action-cache), so jobs don't download every action from GitHub again
 
 ## Why?
 
@@ -140,6 +140,7 @@ settings:
   cache-max-age-days: 7
   max-cache-size-gb: 10
   max-docker-data-size-gb: 15
+  max-action-cache-size-gb: 1  # the action cache; kept whether or not automatic-disk-cleanup is on
   daily-vm-trim: true  # turns VM TRIM on or off; the name predates the interval
   vm-trim-interval-minutes: 10
 ```
@@ -168,6 +169,7 @@ runners, deregisters them from GitHub, and deletes every location Mac Runner wri
 | Location | Contents |
 | --- | --- |
 | `~/.mac-runner` | Runner workspaces — the extracted runner release and its `_work` checkout, typically >1 GB each |
+| `~/.mac-runner/action-archives` | The [action cache](#action-cache) |
 | `~/Library/Application Support/MacRunner` | `config.json`, PID files, container kernel |
 | `~/Library/Preferences/{com.omniaura.mac-runner,mac-runner}.plist` | App and CLI preferences |
 | `~/Library/HTTPStorages/*`, `~/Library/Caches/*` | Cached update checks |
@@ -240,6 +242,7 @@ runners:
     tools: []                      # container isolation: tools to install at start; [] = none (default: detected)
     cache: [/home/runner/.cargo/registry]   # Docker engine: container paths kept in volumes across jobs
     docker: true                   # Docker engine: Docker for jobs, Docker-in-Docker (default: false)
+    action-cache: true             # actions from the Mac's action cache (default: on for jit runners)
     enable-gui: false              # default: false (headless)
     open-files: 65536              # default: the global limit
     quiet-hours: never             # never | { start, end } (default: global schedule)
@@ -251,7 +254,7 @@ Runners are matched by name. What happens to an existing runner depends on what 
 |---|---|
 | New name | Registers and starts the runner |
 | `repo`/`org`, `labels`, or `isolation` | Unregisters and registers the runner again |
-| `enable-gui`, `open-files`, `image`, `engine`, `cpus`, `memory`, `jit`, `tools`, `cache`, or `docker` | Updates it, restarting it if it's running |
+| `enable-gui`, `open-files`, `image`, `engine`, `cpus`, `memory`, `jit`, `tools`, `cache`, `docker`, or `action-cache` | Updates it, restarting it if it's running (`action-cache` only when that turns the cache on or off for it) |
 | `quiet-hours` | Updates it in place |
 | Name no longer in the file | Unregisters it and deletes its workspace (unless `--no-prune`) |
 
@@ -307,6 +310,25 @@ Good candidates, for an image whose user is `runner`:
 | pnpm | `/home/runner/.local/share/pnpm/store`, with the store set to that absolute path in the workflow (`pnpm config set store-dir /home/runner/.local/share/pnpm/store`): by default pnpm keeps its store on the project's filesystem, which here is the work volume, emptied for every job |
 
 Cache what a tool downloads, not the tool: a volume keeps the first contents it got, so caching all of `~/.cargo` would freeze the toolchain the image ships.
+
+### Action Cache
+
+The runner empties `_work/_actions` at the start of every job, so without help every job downloads every action it uses (`actions/checkout`, `actions/setup-node`, …) from `codeload.github.com`, and all of a Mac's runners do it from one address. When GitHub rate-limits that address, jobs fail in **Set up job** with `Failed to download action … 429 (Too Many Requests)`.
+
+The runner (2.310 and later) can take actions from an archive cache instead: when `ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE` names a directory, it looks there for `<owner>_<repo>/<commit SHA>.tar.gz` before downloading an action, and extracts that copy. Mac Runner keeps one such cache per Mac, in `~/.mac-runner/action-archives`, shared by all its runners:
+
+- Runners without isolation and dedicated-user runners get its path.
+- Docker runners get it mounted read-only at `/mac-runner/action-archives`, so their jobs can't change what later jobs run. Apple's engine doesn't support it.
+
+The runner only reads the cache, and deletes what it downloads, so Mac Runner fills it. The worker logs each archive it looked for (`_diag/Worker_*.log`); every 30 seconds the menu bar app reads what's new there, downloads each archive that's missing once from `codeload.github.com`, checks that it's a whole `.tar.gz` with a single top-level directory (the runner fails the job on anything else), and renames it into place, so a runner never sees part of one. The first job to use an action at a new commit downloads it as before; the jobs after it on that Mac take it from the cache. Keep the app running, as for JIT runners.
+
+- **Public actions only.** Mac Runner downloads without credentials, so it caches only actions from public repositories; jobs keep downloading actions from private or internal repositories themselves. (A job can write its own `_diag`, so a forged log line must not be able to put a private repository where later jobs could read it.)
+- **On by default for [JIT runners](#just-in-time-runners).** `mac-runner add … --action-cache` (or `action-cache: true` in a config file) turns it on for a long-lived runner, which also downloads every action for every job; `--no-action-cache` (`action-cache: false`) turns it off. A runner picks up a change when it next starts; `apply` restarts it when the change turns the cache on or off for it.
+- **Size.** It's kept under `max-action-cache-size-gb` (default 1, Settings → **Action cache budget**), dropping the least recently used archives first, and archives no job has asked for in `cache-max-age-days` (default 7) go, whether or not automatic disk cleanup is on. An archive over 512 MB isn't kept.
+- **Failures.** A download that fails is tried again the next time a job asks for that archive, after a minute, doubling up to an hour; one GitHub answers 404 (a private repository, say) after a day. If a runner can't extract an archive it took from the cache, Mac Runner deletes it. Either way the job downloads the action itself, as without a cache.
+- `mac-runner status` shows what the cache holds and which runners use it, and the app's log shows each archive it saves. To empty it, delete `~/.mac-runner/action-archives`; `mac-runner uninstall` deletes it too.
+
+Jobs on a runner without isolation run as your user, and can write to the cache like anything else in your home; use user or container isolation for jobs you don't trust.
 
 ### Skipping Tool Installation
 

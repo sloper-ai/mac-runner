@@ -21,6 +21,8 @@ struct AddCommand: Equatable {
     var cachePaths: [String] = []
     /// Give jobs their own Docker daemon (Docker-in-Docker).
     var docker = false
+    /// Take actions from the Mac's action archive cache (nil = on for JIT runners).
+    var actionCache: Bool?
 
     /// Parses the target and its options. Options it doesn't know are skipped.
     static func parse(
@@ -106,6 +108,12 @@ struct AddCommand: Equatable {
             case "--docker":
                 command.docker = true
                 i += 1
+            case "--action-cache":
+                command.actionCache = true
+                i += 1
+            case "--no-action-cache":
+                command.actionCache = false
+                i += 1
             case "--cache":
                 guard i + 1 < args.count else {
                     return .failure(.message("--cache requires a container path"))
@@ -154,6 +162,9 @@ struct AddCommand: Equatable {
         }
         if docker && engine != .docker {
             return .message("--docker needs the Docker engine (--engine docker)")
+        }
+        if actionCache == true && engine != .docker {
+            return .message("--action-cache needs the Docker engine (--engine docker) with container isolation: Apple's engine can't mount it")
         }
         return nil
     }

@@ -24,6 +24,7 @@ import Yams
 ///     tools: []           # install nothing at start (default: detected tools)
 ///     cache: [/home/runner/.cargo/registry]   # Docker volumes kept across jobs
 ///     docker: true        # Docker for jobs (Docker-in-Docker), Docker engine only
+///     action-cache: true  # actions from the Mac's action archive cache (default: on for jit)
 ///     enable-gui: false
 ///     open-files: 65536
 ///     quiet-hours: never
@@ -44,6 +45,7 @@ struct DeclarativeConfig: Codable, Equatable {
         var cacheMaxAgeDays: Int?
         var maxCacheSizeGB: Int?
         var maxDockerDataSizeGB: Int?
+        var maxActionCacheSizeGB: Int?
         var dailyVMTrim: Bool?
         var vmTrimIntervalMinutes: Int?
 
@@ -58,6 +60,7 @@ struct DeclarativeConfig: Codable, Equatable {
             case cacheMaxAgeDays = "cache-max-age-days"
             case maxCacheSizeGB = "max-cache-size-gb"
             case maxDockerDataSizeGB = "max-docker-data-size-gb"
+            case maxActionCacheSizeGB = "max-action-cache-size-gb"
             case dailyVMTrim = "daily-vm-trim"
             case vmTrimIntervalMinutes = "vm-trim-interval-minutes"
         }
@@ -81,9 +84,11 @@ struct DeclarativeConfig: Codable, Equatable {
         var tools: [String]?
         var cache: [String]?
         var docker: Bool?
+        var actionCache: Bool?
 
         enum CodingKeys: String, CodingKey {
             case name, repo, org, labels, isolation, image, engine, cpus, memory, count, jit, tools, cache, docker
+            case actionCache = "action-cache"
             case enableGUI = "enable-gui"
             case openFiles = "open-files"
             case quietHours = "quiet-hours"
@@ -207,12 +212,12 @@ struct DeclarativeConfig: Codable, Equatable {
         }
         try check(root, allowed: ["version", "settings", "runners"], context: "")
         if let settings = root["settings"] as? [String: Any] {
-            try check(settings, allowed: ["isolation", "quiet-hours", "pause-on-battery", "battery-threshold", "automatic-disk-cleanup", "minimum-free-disk-space-gb", "minimum-guest-free-disk-space-gb", "cache-max-age-days", "max-cache-size-gb", "max-docker-data-size-gb", "daily-vm-trim", "vm-trim-interval-minutes"], context: " in settings")
+            try check(settings, allowed: ["isolation", "quiet-hours", "pause-on-battery", "battery-threshold", "automatic-disk-cleanup", "minimum-free-disk-space-gb", "minimum-guest-free-disk-space-gb", "cache-max-age-days", "max-cache-size-gb", "max-docker-data-size-gb", "max-action-cache-size-gb", "daily-vm-trim", "vm-trim-interval-minutes"], context: " in settings")
         }
         for (index, runner) in ((root["runners"] as? [Any]) ?? []).enumerated() {
             guard let runner = runner as? [String: Any] else { continue }
             let name = (runner["name"] as? String).map { " '\($0)'" } ?? " #\(index + 1)"
-            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "engine", "cpus", "memory", "count", "jit", "tools", "cache", "docker"], context: " in runner\(name)")
+            try check(runner, allowed: ["name", "repo", "org", "labels", "isolation", "enable-gui", "open-files", "quiet-hours", "image", "engine", "cpus", "memory", "count", "jit", "tools", "cache", "docker", "action-cache"], context: " in runner\(name)")
         }
     }
 
@@ -293,6 +298,9 @@ struct DeclarativeConfig: Codable, Equatable {
             if spec.docker == true && engine != .docker {
                 throw DeclarativeConfigError.invalid("\(name): docker requires the Docker engine (engine: docker)")
             }
+            if spec.actionCache == true && effectiveIsolation == .container && engine != .docker {
+                throw DeclarativeConfigError.invalid("\(name): action-cache requires the Docker engine (engine: docker) or no container isolation")
+            }
             let labels = spec.labels ?? Runner.defaultLabels(for: effectiveIsolation)
             if spec.jit == true && labels.isEmpty {
                 throw DeclarativeConfigError.invalid("\(name): a jit runner needs at least one label (GitHub gives it only those)")
@@ -319,7 +327,8 @@ struct DeclarativeConfig: Codable, Equatable {
                 jit: spec.jit ?? false,
                 containerToolsOverride: tools,
                 containerCachePaths: cachePaths.flatMap { $0.isEmpty ? nil : $0 },
-                dockerInDocker: spec.docker ?? false
+                dockerInDocker: spec.docker ?? false,
+                actionCache: spec.actionCache
             )
             if count == 1 {
                 result.append(desired)
@@ -432,6 +441,7 @@ struct DeclarativeConfig: Codable, Equatable {
         result.storageMaintenance.minimumGuestFreeDiskSpaceGB = try size(settings.minimumGuestFreeDiskSpaceGB, "minimum-guest-free-disk-space-gb", result.storageMaintenance.minimumGuestFreeDiskSpaceGB)
         result.storageMaintenance.maxCacheSizeGB = try size(settings.maxCacheSizeGB, "max-cache-size-gb", result.storageMaintenance.maxCacheSizeGB)
         result.storageMaintenance.maxDockerDataSizeGB = try size(settings.maxDockerDataSizeGB, "max-docker-data-size-gb", result.storageMaintenance.maxDockerDataSizeGB)
+        result.storageMaintenance.maxActionCacheSizeGB = try size(settings.maxActionCacheSizeGB, "max-action-cache-size-gb", result.storageMaintenance.maxActionCacheSizeGB)
         if let days = settings.cacheMaxAgeDays {
             guard StorageMaintenanceSettings.ageRange.contains(days) else {
                 throw DeclarativeConfigError.invalid("settings: cache-max-age-days must be 1-365")
@@ -464,6 +474,7 @@ struct DeclarativeConfig: Codable, Equatable {
                 cacheMaxAgeDays: settings.storageMaintenance.cacheMaxAgeDays,
                 maxCacheSizeGB: settings.storageMaintenance.maxCacheSizeGB,
                 maxDockerDataSizeGB: settings.storageMaintenance.maxDockerDataSizeGB,
+                maxActionCacheSizeGB: settings.storageMaintenance.maxActionCacheSizeGB,
                 dailyVMTrim: settings.storageMaintenance.dailyVMTrimEnabled,
                 vmTrimIntervalMinutes: settings.storageMaintenance.vmTrimIntervalMinutes
             ),
@@ -485,7 +496,8 @@ struct DeclarativeConfig: Codable, Equatable {
                     jit: runner.isJIT ? true : nil,
                     tools: runner.containerToolsOverride,
                     cache: runner.containerCachePaths.flatMap { $0.isEmpty ? nil : $0 },
-                    docker: runner.dockerInDocker == true ? true : nil
+                    docker: runner.dockerInDocker == true ? true : nil,
+                    actionCache: runner.actionCache
                 )
             }
         )
@@ -534,6 +546,15 @@ struct DesiredRunner: Equatable {
     var containerCachePaths: [String]? = nil
     /// Docker engine: Docker for jobs (Docker-in-Docker).
     var dockerInDocker: Bool = false
+    /// The action archive cache; nil = on for JIT runners.
+    var actionCache: Bool? = nil
+
+    /// Whether its jobs would take actions from the action archive cache, as
+    /// `Runner.usesActionCache` decides it.
+    func usesActionCache(global globalMode: IsolationMode) -> Bool {
+        let supported = (isolation ?? globalMode) != .container || containerEngine == .docker
+        return supported && (actionCache ?? jit)
+    }
 }
 
 /// What `mac-runner apply` will do.
@@ -660,6 +681,13 @@ enum ConfigPlanner {
                 updates.append(want.dockerInDocker ? "docker on" : "docker off")
                 restart = true
             }
+            if have.actionCache != want.actionCache {
+                updates.append("action-cache \(describeSwitch(have.actionCache)) → \(describeSwitch(want.actionCache))")
+                // Pinning it to what the runner does already restarts nothing.
+                if have.usesActionCache(global: currentSettings.isolationMode) != want.usesActionCache(global: desiredSettings.isolationMode) {
+                    restart = true
+                }
+            }
             if !QuietHours.equivalent(have.quietHours, want.quietHours) {
                 updates.append("quiet-hours \(describe(have.quietHours)) → \(describe(want.quietHours))")
             }
@@ -689,6 +717,11 @@ enum ConfigPlanner {
     static func describeTools(_ tools: [String]?) -> String {
         guard let tools else { return "detected" }
         return tools.isEmpty ? "none" : "[\(tools.joined(separator: ", "))]"
+    }
+
+    /// An optional on/off setting: on, off, or default.
+    static func describeSwitch(_ value: Bool?) -> String {
+        value.map { $0 ? "on" : "off" } ?? "default"
     }
 
     static func describeCache(_ paths: [String]?) -> String {

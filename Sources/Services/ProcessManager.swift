@@ -23,6 +23,10 @@ class ProcessManager {
     ///   - jitConfig: A JIT runner's config, for `.none` and `.dedicatedUser`:
     ///     the launch resets the workspace and hands it to run.sh in
     ///     `ACTIONS_RUNNER_INPUT_JITCONFIG` (never in argv; see `JITRunner`).
+    ///   - actionArchiveCache: The action archive cache's directory, for `.none`
+    ///     and `.dedicatedUser`: the runner gets it in
+    ///     `ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE` (not a secret, so a dedicated
+    ///     user's launch command can carry it).
     /// - Returns: The launched Process object
     /// - Throws: Error if process launch or PID write fails
     func startProcess(
@@ -34,7 +38,8 @@ class ProcessManager {
         enableGUI: Bool = false,
         openFileLimit: Int,
         extraEnvironment: [String: String] = [:],
-        jitConfig: String? = nil
+        jitConfig: String? = nil,
+        actionArchiveCache: String? = nil
     ) throws -> Process {
         let process: Process
 
@@ -64,6 +69,9 @@ class ProcessManager {
             if let jitConfig {
                 // Without sudo, the environment reaches run.sh as it is.
                 extra[JITRunner.configVariable] = jitConfig
+            }
+            if let actionArchiveCache {
+                extra[ActionArchiveCache.variable] = actionArchiveCache
             }
             proc.environment = env.merging(extra) { _, extra in extra }
 
@@ -122,7 +130,8 @@ class ProcessManager {
                     standardError: logHandle,
                     enableGUI: enableGUI,
                     openFileLimit: openFileLimit,
-                    jitConfigFile: jitConfigFile
+                    jitConfigFile: jitConfigFile,
+                    actionArchiveCache: actionArchiveCache
                 )
                 process = proc
             } catch {

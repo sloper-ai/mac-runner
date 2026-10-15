@@ -91,6 +91,9 @@ class RunnerManager: ObservableObject {
     private var lastStorageMaintenanceCheck: Date?
     private var lastStorageWarning: String?
     private var storageMaintenanceTask: Task<Void, Never>?
+    private let actionArchiveCacheFiller = ActionArchiveCacheFiller()
+    private var actionCacheTask: Task<Void, Never>?
+    private var lastActionCacheRefresh: Date?
     private var lastLogMaintenance: Date?
     private var lastDiskMeasurement: Date?
     private var workspaceSizes: [UUID: ResourceMonitor.DiskMeasurement] = [:]
@@ -532,6 +535,7 @@ class RunnerManager: ObservableObject {
     ///     instead of the detected ones ([] = none)
     ///   - containerCachePaths: Docker engine: container paths kept in cache volumes
     ///   - dockerInDocker: Docker engine: give jobs their own Docker daemon
+    ///   - actionCache: Take actions from the Mac's action archive cache (nil = on for JIT runners)
     /// - Throws: RunnerError if validation or setup fails
     func addRunner(
         name: String,
@@ -548,7 +552,8 @@ class RunnerManager: ObservableObject {
         jit: Bool = false,
         containerToolsOverride: [String]? = nil,
         containerCachePaths: [String]? = nil,
-        dockerInDocker: Bool = false
+        dockerInDocker: Bool = false,
+        actionCache: Bool? = nil
     ) async throws {
         isLoading = true
         defer { isLoading = false }
@@ -583,6 +588,10 @@ class RunnerManager: ObservableObject {
             guard runner.runsInDocker(global: currentSettings.isolationMode) else { throw RunnerError.dockerInDockerNeedsDocker }
             runner.dockerInDocker = true
         }
+        if actionCache == true && !runner.supportsActionCache(global: currentSettings.isolationMode) {
+            throw RunnerError.actionCacheUnsupported
+        }
+        runner.actionCache = actionCache
         if runner.isJIT && labels.isEmpty {
             // GitHub gives a JIT runner exactly the labels it's registered with.
             throw RunnerError.jitNeedsLabels
@@ -883,6 +892,7 @@ class RunnerManager: ObservableObject {
                     registration = .token(try await ghService.getRegistrationToken(for: runner.target))
                 }
                 let cachePaths = runner.containerCachePaths ?? []
+                let actionCache = actionCacheDirectory(for: runner)
                 let variables = ContainerRunnerScript.variables(
                     registrationURL: runner.target.registrationURL,
                     registration: registration,
@@ -893,7 +903,8 @@ class RunnerManager: ObservableObject {
                     tools: runner.effectiveContainerTools,
                     enableGUI: runner.enableGUI,
                     cacheDirectories: cachePaths,
-                    dockerInDocker: runner.dockerInDocker == true
+                    dockerInDocker: runner.dockerInDocker == true,
+                    actionArchiveCache: actionCache != nil
                 ) + DockerRunnerEngine.engineVariables
 
                 _ = try Self.makeDirectory(runnerDir, "_diag")
@@ -910,7 +921,8 @@ class RunnerManager: ObservableObject {
                     // A JIT runner's job gets an empty work volume; caches and Docker's images stay.
                     resetWorkVolume: runner.isJIT,
                     cacheMounts: DockerRunnerEngine.cacheMounts(for: id, paths: cachePaths),
-                    dockerInDocker: runner.dockerInDocker == true
+                    dockerInDocker: runner.dockerInDocker == true,
+                    actionCacheDirectory: actionCache
                 )
                 let process = try processManager.startProcess(
                     for: id,
@@ -1054,7 +1066,8 @@ class RunnerManager: ObservableObject {
                     isolation: isolation,
                     enableGUI: runner.enableGUI,
                     openFileLimit: runner.effectiveOpenFileLimit(global: currentSettings.openFileLimit),
-                    jitConfig: jitConfig
+                    jitConfig: jitConfig,
+                    actionArchiveCache: actionCacheDirectory(for: runner)
                 )
                 track(process, for: id, launchToken: launchToken)
             }
@@ -1803,6 +1816,7 @@ class RunnerManager: ObservableObject {
         runners[index].containerToolsOverride = desired.containerToolsOverride
         runners[index].containerCachePaths = desired.containerCachePaths.flatMap { $0.isEmpty ? nil : $0 }
         runners[index].dockerInDocker = desired.dockerInDocker ? true : nil
+        runners[index].actionCache = desired.actionCache
         if !(switchesEngine && restart) {
             runners[index].containerEngine = desired.containerEngine
         }
@@ -1930,7 +1944,8 @@ class RunnerManager: ObservableObject {
             jit: desired.jit,
             containerToolsOverride: desired.containerToolsOverride,
             containerCachePaths: desired.containerCachePaths,
-            dockerInDocker: desired.dockerInDocker
+            dockerInDocker: desired.dockerInDocker,
+            actionCache: desired.actionCache
         )
         if let quietHours = desired.quietHours, let runner = runner(named: desired.name) {
             setQuietHours(quietHours, for: runner.id)
@@ -2434,6 +2449,7 @@ class RunnerManager: ObservableObject {
         }
 
         runStorageMaintenanceIfNeeded()
+        refreshActionCacheIfNeeded()
         maintainRunnerLogsIfNeeded()
 
         if automationEnabled {
@@ -2516,6 +2532,47 @@ class RunnerManager: ObservableObject {
         }
     }
 
+    // MARK: - Action Archive Cache
+
+    /// The action archive cache for `runner`'s start, created if needed. nil
+    /// when it doesn't use one, or when the cache can't be made: its jobs then
+    /// download actions, as without it.
+    private func actionCacheDirectory(for runner: Runner) -> String? {
+        guard runner.usesActionCache(global: currentSettings.isolationMode) else { return nil }
+        do {
+            return try ActionArchiveCache.prepareDirectory().path
+        } catch {
+            logRunnerEvent(for: runner, message: "Action cache unavailable, so jobs download their actions: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// The app fills the action archive cache from the worker logs of runners
+    /// that use it, every 30 seconds, so an action a job just downloaded is
+    /// there for the next (see `ActionArchiveCache`). It also keeps the cache
+    /// within its budget.
+    private func refreshActionCacheIfNeeded(now: Date = Date()) {
+        guard automationEnabled, actionCacheTask == nil else { return }
+        if let last = lastActionCacheRefresh, now.timeIntervalSince(last) < 30 { return }
+        lastActionCacheRefresh = now
+        let global = currentSettings.isolationMode
+        let diagnostics = runners.filter { $0.usesActionCache(global: global) }.map { runner in
+            RunnerDirectory.directoryURL(for: runner.id, isolation: runner.effectiveIsolationMode(global: global))
+                .appendingPathComponent("_diag", isDirectory: true)
+        }
+        let policy = currentSettings.storageMaintenance
+        let filler = actionArchiveCacheFiller
+        actionCacheTask = Task { [weak self] in
+            let messages = await filler.refresh(
+                diagnosticsDirectories: diagnostics,
+                maxBytes: StorageMaintenanceSettings.bytes(policy.maxActionCacheSizeGB),
+                maxAgeDays: policy.cacheMaxAgeDays
+            )
+            for message in messages { print("Action cache: " + message) }
+            self?.actionCacheTask = nil
+        }
+    }
+
     // MARK: - Duplicate Runner
 
     /// Strip a trailing `-N` numeric suffix from a runner name to get the base name.
@@ -2589,7 +2646,8 @@ class RunnerManager: ObservableObject {
             jit: originalRunner.isJIT,
             containerToolsOverride: originalRunner.containerToolsOverride,
             containerCachePaths: originalRunner.containerCachePaths,
-            dockerInDocker: originalRunner.dockerInDocker == true
+            dockerInDocker: originalRunner.dockerInDocker == true,
+            actionCache: originalRunner.actionCache
         )
     }
 
@@ -3311,6 +3369,7 @@ enum RunnerError: LocalizedError {
     case jitNeedsLabels
     case cacheNeedsDocker
     case dockerInDockerNeedsDocker
+    case actionCacheUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -3339,6 +3398,8 @@ enum RunnerError: LocalizedError {
             return "Cache volumes need container isolation on the Docker engine (--isolation container --engine docker)."
         case .dockerInDockerNeedsDocker:
             return "Docker for jobs (Docker-in-Docker) needs container isolation on the Docker engine (--isolation container --engine docker)."
+        case .actionCacheUnsupported:
+            return "The action cache needs a runner without container isolation, or one on the Docker engine (--engine docker): Apple's engine can't mount it."
         }
     }
 }

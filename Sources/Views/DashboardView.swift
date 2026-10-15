@@ -346,6 +346,11 @@ struct RunnerDetailView: View {
                     }
                 }
             }
+            if runner.supportsActionCache(global: runnerManager.currentSettings.isolationMode) {
+                DetailRow("Action cache", runner.usesActionCache(global: runnerManager.currentSettings.isolationMode)
+                    ? "On, shared: \(ActionArchiveCache.directory().path)"
+                    : "Off (downloads actions for each job)")
+            }
             DetailRow("Display", runner.enableGUI ? "GUI access" : "Headless")
             DetailRow("Labels", runner.labels.isEmpty ? "—" : runner.labels.joined(separator: ", "))
             DetailRow("Open files", "\(runner.effectiveOpenFileLimit(global: runnerManager.currentSettings.openFileLimit))")

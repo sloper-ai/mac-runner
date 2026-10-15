@@ -7,6 +7,9 @@ struct StorageMaintenanceSettings: Codable, Sendable, Equatable {
     var cacheMaxAgeDays: Int = 7
     var maxCacheSizeGB: Int = 10
     var maxDockerDataSizeGB: Int = 15
+    /// The action archive cache's budget (`ActionArchiveCache`), kept whether or
+    /// not automatic maintenance is on: Mac Runner fills that cache itself.
+    var maxActionCacheSizeGB: Int = 1
     /// Turns VM TRIM on or off. The name and the `daily-vm-trim` key predate `vmTrimIntervalMinutes`.
     var dailyVMTrimEnabled: Bool = true
     /// Minutes between VM TRIMs. Jobs free tens of GB inside the VM, which the Mac gets back only through TRIM.
@@ -25,6 +28,7 @@ struct StorageMaintenanceSettings: Codable, Sendable, Equatable {
         cacheMaxAgeDays = min(max(try values.decodeIfPresent(Int.self, forKey: .cacheMaxAgeDays) ?? 7, 1), 365)
         maxCacheSizeGB = Self.size(try values.decodeIfPresent(Int.self, forKey: .maxCacheSizeGB) ?? 10)
         maxDockerDataSizeGB = Self.size(try values.decodeIfPresent(Int.self, forKey: .maxDockerDataSizeGB) ?? 15)
+        maxActionCacheSizeGB = Self.size(try values.decodeIfPresent(Int.self, forKey: .maxActionCacheSizeGB) ?? 1)
         dailyVMTrimEnabled = try values.decodeIfPresent(Bool.self, forKey: .dailyVMTrimEnabled) ?? true
         vmTrimIntervalMinutes = min(max(try values.decodeIfPresent(Int.self, forKey: .vmTrimIntervalMinutes) ?? 10,
                                         Self.trimIntervalRange.lowerBound), Self.trimIntervalRange.upperBound)

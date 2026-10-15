@@ -22,6 +22,8 @@ struct StorageMaintenanceSettingsSection: View {
                     value: binding(\.maxCacheSizeGB), in: 1...500)
             Stepper("Private Docker cache budget: \(runnerManager.currentSettings.storageMaintenance.maxDockerDataSizeGB) GB",
                     value: binding(\.maxDockerDataSizeGB), in: 1...500)
+            Stepper("Action cache budget: \(runnerManager.currentSettings.storageMaintenance.maxActionCacheSizeGB) GB",
+                    value: binding(\.maxActionCacheSizeGB), in: 1...500)
             Stepper("Cache retention: \(runnerManager.currentSettings.storageMaintenance.cacheMaxAgeDays) days",
                     value: binding(\.cacheMaxAgeDays), in: 1...365)
             Toggle("Trim Supported Local VM Disks", isOn: Binding(

@@ -167,6 +167,9 @@ enum CLIHandler {
           --no-tools           Container isolation: install no tools when the container starts
           --cache <path>       Docker engine: keep this container path in a volume across jobs (repeatable)
           --docker             Docker engine: give jobs Docker of their own (Docker-in-Docker; privileged container)
+          --action-cache       Take actions from the Mac's action archive cache instead of downloading them for each job
+                               (default for --jit runners; not on Apple's engine)
+          --no-action-cache    Download actions for each job, even on a JIT runner
 
         SETUP OPTIONS:
           --teardown        Remove isolation (delete user, sudoers, reset config)
@@ -357,7 +360,8 @@ enum CLIHandler {
                 jit: command.jit,
                 containerToolsOverride: command.containerToolsOverride,
                 containerCachePaths: command.cachePaths.isEmpty ? nil : command.cachePaths,
-                dockerInDocker: command.docker
+                dockerInDocker: command.docker,
+                actionCache: command.actionCache
             )
             let added = manager.runner(named: name)
             var message = "Runner '\(name)' added"
@@ -581,6 +585,10 @@ enum CLIHandler {
                 print("    \(line)")
             }
         }
+        if let line = actionCacheStatusLine(runners: runners, global: globalMode,
+                                            budgetGB: manager.currentSettings.storageMaintenance.maxActionCacheSizeGB) {
+            print("  \(line)")
+        }
         if runners.contains(where: { $0.runsInDocker(global: globalMode) }) {
             let docker = DockerRunnerEngine.executablePath()
             let state: String
@@ -617,6 +625,22 @@ enum CLIHandler {
             }
             return "\(runner.name): JIT, \(state)"
         }
+    }
+
+    /// `status` line for the action archive cache, when a runner uses it or
+    /// it has archives: where it is, what it holds, and who uses it.
+    static func actionCacheStatusLine(
+        runners: [Runner],
+        global globalMode: IsolationMode,
+        budgetGB: Int,
+        directory: URL = ActionArchiveCache.directory()
+    ) -> String? {
+        let users = runners.filter { $0.usesActionCache(global: globalMode) }.map(\.name).sorted()
+        let contents = ActionArchiveCache.contents(of: directory)
+        guard !users.isEmpty || contents.archives > 0 else { return nil }
+        let size = ByteCountFormatter.string(fromByteCount: contents.bytes, countStyle: .file)
+        return "Action cache: \(directory.path), \(contents.archives) archive(s), \(size) of \(budgetGB) GB; "
+            + (users.isEmpty ? "no runner uses it" : "used by \(users.joined(separator: ", "))")
     }
 
     /// What to tell someone who just started a JIT runner from the CLI.
