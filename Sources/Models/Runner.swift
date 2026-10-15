@@ -69,6 +69,10 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     /// Docker engine: give jobs their own Docker daemon (Docker-in-Docker) in a
     /// privileged container, its images kept in a volume across jobs. nil = off.
     var dockerInDocker: Bool?
+    /// Whether jobs take actions from the Mac's action archive cache
+    /// (`ActionArchiveCache`) instead of downloading them each time. nil = on
+    /// for a JIT runner, off for a long-lived one.
+    var actionCache: Bool?
 
     init(
         id: UUID = UUID(),
@@ -92,7 +96,8 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         jit: Bool? = nil,
         containerToolsOverride: [String]? = nil,
         containerCachePaths: [String]? = nil,
-        dockerInDocker: Bool? = nil
+        dockerInDocker: Bool? = nil,
+        actionCache: Bool? = nil
     ) {
         self.id = id
         self.name = name
@@ -116,6 +121,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         self.containerToolsOverride = containerToolsOverride
         self.containerCachePaths = containerCachePaths.flatMap { $0.isEmpty ? nil : $0 }
         self.dockerInDocker = dockerInDocker == true ? true : nil
+        self.actionCache = actionCache
     }
 
     init(from decoder: Decoder) throws {
@@ -156,6 +162,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         containerToolsOverride = try container.decodeIfPresent([String].self, forKey: .containerToolsOverride)
         containerCachePaths = try container.decodeIfPresent([String].self, forKey: .containerCachePaths)
         dockerInDocker = try container.decodeIfPresent(Bool.self, forKey: .dockerInDocker) == true ? true : nil
+        actionCache = try container.decodeIfPresent(Bool.self, forKey: .actionCache)
     }
 
     /// User-editable settings, compared when reconciling concurrent config edits.
@@ -181,6 +188,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
         var containerToolsOverride: [String]?
         var containerCachePaths: [String]?
         var dockerInDocker: Bool?
+        var actionCache: Bool?
     }
 
     var configuration: Configuration {
@@ -194,7 +202,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
                 containerCPUs: containerCPUs, containerMemoryMB: containerMemoryMB,
                 jit: jit, jitRegistration: jitRegistration,
                 containerToolsOverride: containerToolsOverride, containerCachePaths: containerCachePaths,
-                dockerInDocker: dockerInDocker
+                dockerInDocker: dockerInDocker, actionCache: actionCache
             )
         }
         set {
@@ -218,6 +226,7 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
             containerToolsOverride = newValue.containerToolsOverride
             containerCachePaths = newValue.containerCachePaths
             dockerInDocker = newValue.dockerInDocker
+            actionCache = newValue.actionCache
         }
     }
 
@@ -322,6 +331,18 @@ struct Runner: Identifiable, Codable, Sendable, Equatable {
     /// Whether its jobs get Docker of their own: on, for a runner on the Docker engine.
     func usesDockerInDocker(global globalMode: IsolationMode) -> Bool {
         dockerInDocker == true && runsInDocker(global: globalMode)
+    }
+
+    /// Whether it can use the action archive cache: a native runner, or one on
+    /// the Docker engine. Apple's engine has no way to mount it.
+    func supportsActionCache(global globalMode: IsolationMode) -> Bool {
+        effectiveIsolationMode(global: globalMode) != .container || effectiveContainerEngine == .docker
+    }
+
+    /// Whether its jobs take actions from the action archive cache: its own
+    /// setting, else on for a JIT runner, where it can.
+    func usesActionCache(global globalMode: IsolationMode) -> Bool {
+        supportsActionCache(global: globalMode) && (actionCache ?? isJIT)
     }
 
     func effectiveOpenFileLimit(global globalLimit: Int) -> Int {

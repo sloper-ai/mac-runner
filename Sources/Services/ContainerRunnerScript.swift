@@ -281,8 +281,9 @@ enum ContainerRunnerScript {
 
     /// The script's inputs, in a fixed order: the container environment both
     /// engines give it. Values are passed as they are, never through a shell.
-    /// `cacheDirectories` (Docker cache volumes) and `MR_DOCKER` (Docker-in-Docker)
-    /// are only listed when used, so other runners get the same inputs as before.
+    /// `cacheDirectories` (Docker cache volumes), `MR_DOCKER` (Docker-in-Docker),
+    /// and the action archive cache's location are only listed when used, so
+    /// other runners get the same inputs as before.
     static func variables(
         registrationURL: String,
         registration: Registration,
@@ -293,7 +294,8 @@ enum ContainerRunnerScript {
         tools: [String],
         enableGUI: Bool,
         cacheDirectories: [String] = [],
-        dockerInDocker: Bool = false
+        dockerInDocker: Bool = false,
+        actionArchiveCache: Bool = false
     ) -> [(name: String, value: String)] {
         let apt = aptPackages(for: tools)
         var variables = [
@@ -317,6 +319,10 @@ enum ContainerRunnerScript {
         }
         if dockerInDocker {
             variables.append(("MR_DOCKER", "1"))
+        }
+        if actionArchiveCache {
+            // The runner reads it itself; Docker mounts the cache there, read-only.
+            variables.append((ActionArchiveCache.variable, ActionArchiveCache.containerMount))
         }
         return variables
     }

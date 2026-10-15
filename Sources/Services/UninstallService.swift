@@ -267,6 +267,7 @@ struct UninstallService {
         // so that anything a user stored alongside them survives. The root itself is
         // removed by `removeEmptyStorageRoots()` once it holds nothing.
         var urls = [
+            ActionArchiveCache.directory(home: homeDirectory),
             homeDirectory.appendingPathComponent("Library/Application Support/MacRunner", isDirectory: true),
             homeDirectory.appendingPathComponent("Library/Preferences/com.omniaura.mac-runner.plist"),
             // The CLI writes update-check state under its own bare domain.
@@ -321,6 +322,7 @@ struct UninstallService {
         let path = url.path
         if path.hasSuffix(".plist") && path.contains("/Preferences/") { return .preferences }
         if path.contains("/Caches/") || path.contains("/HTTPStorages/") { return .cache }
+        if url.standardizedFileURL == ActionArchiveCache.directory(home: homeDirectory).standardizedFileURL { return .cache }
         if path.contains("/Saved Application State/") { return .cache }
         return .configuration
     }

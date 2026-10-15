@@ -114,6 +114,9 @@ enum DockerRunnerEngine {
     ///   - cacheMounts: Volumes mounted at these container paths, kept across containers.
     ///   - dockerInDocker: Run the container privileged, with the volume for its
     ///     own Docker daemon's data at /var/lib/docker (kept across containers).
+    ///   - actionCacheDirectory: The Mac's action archive cache, mounted read-only
+    ///     at `ActionArchiveCache.containerMount`: the runner only reads it, and
+    ///     jobs mustn't change what later jobs run.
     static func launcherScript(
         docker: String,
         runnerID: UUID,
@@ -126,7 +129,8 @@ enum DockerRunnerEngine {
         environmentNames: [String],
         resetWorkVolume: Bool = false,
         cacheMounts: [(volume: String, path: String)] = [],
-        dockerInDocker: Bool = false
+        dockerInDocker: Bool = false,
+        actionCacheDirectory: String? = nil
     ) -> String {
         let container = containerName(for: runnerID)
         let workVolume = workVolumeName(for: runnerID)
@@ -140,6 +144,7 @@ enum DockerRunnerEngine {
             ["-v", "\(workVolume):\(ContainerRunnerScript.workMount)"],
             cacheMounts.flatMap { ["-v", "\($0.volume):\($0.path)"] },
             dockerInDocker ? ["-v", "\(dockerVolumeName(for: runnerID)):\(dockerDataMount)"] : [],
+            actionCacheDirectory.map { ["-v", "\($0):\(ActionArchiveCache.containerMount):ro"] } ?? [],
             ["-v", "\(runnerDirectory)/_diag:\(ContainerRunnerScript.diagnosticsMount)"],
             ["-v", "\(runnerDirectory)/\(scriptFileName):\(scriptMount):ro"],
             ["--cpus", "\(cpus)", "--memory", "\(memoryMB)m"],
@@ -190,7 +195,8 @@ enum DockerRunnerEngine {
         environmentNames: [String],
         resetWorkVolume: Bool = false,
         cacheMounts: [(volume: String, path: String)] = [],
-        dockerInDocker: Bool = false
+        dockerInDocker: Bool = false,
+        actionCacheDirectory: String? = nil
     ) throws -> String {
         let directory = URL(fileURLWithPath: runnerDirectory, isDirectory: true)
 
@@ -211,7 +217,8 @@ enum DockerRunnerEngine {
             environmentNames: environmentNames,
             resetWorkVolume: resetWorkVolume,
             cacheMounts: cacheMounts,
-            dockerInDocker: dockerInDocker
+            dockerInDocker: dockerInDocker,
+            actionCacheDirectory: actionCacheDirectory
         )
         try contents.write(to: launcher, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: launcher.path)

@@ -165,7 +165,8 @@ class UserIsolationService {
         standardError: Any? = nil,
         enableGUI: Bool = false,
         openFileLimit: Int,
-        jitConfigFile: String? = nil
+        jitConfigFile: String? = nil,
+        actionArchiveCache: String? = nil
     ) throws -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
@@ -176,7 +177,8 @@ class UserIsolationService {
                 directory: currentDirectory,
                 executable: executable,
                 enableGUI: enableGUI,
-                jitConfigFile: jitConfigFile
+                jitConfigFile: jitConfigFile,
+                actionArchiveCache: actionArchiveCache
             ),
             openFileLimit: openFileLimit
         )
@@ -195,17 +197,27 @@ class UserIsolationService {
     }
 
     /// Shell command that starts the runner in its directory, stripping GUI
-    /// access from its environment when `enableGUI` is false. With
-    /// `jitConfigFile`, it first takes the JIT config from that file and resets
-    /// the workspace (`JITRunner.launchPrelude`).
-    static func launchCommand(directory: String, executable: String, enableGUI: Bool, jitConfigFile: String? = nil) -> String {
+    /// access from its environment when `enableGUI` is false, and naming the
+    /// action archive cache when there's one. With `jitConfigFile`, it first
+    /// takes the JIT config from that file and resets the workspace
+    /// (`JITRunner.launchPrelude`).
+    static func launchCommand(
+        directory: String,
+        executable: String,
+        enableGUI: Bool,
+        jitConfigFile: String? = nil,
+        actionArchiveCache: String? = nil
+    ) -> String {
         let escapedDir = directory.replacingOccurrences(of: "'", with: "'\\''")
         let escapedExec = executable.replacingOccurrences(of: "'", with: "'\\''")
         // `env` must wrap the executable itself, not `cd`, or the variables never reach the runner.
-        let headlessEnv = enableGUI
+        var environment = enableGUI
             ? ""
-            : "env -u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE -u XDG_RUNTIME_DIR CI=true HEADLESS=true "
-        let launch = "cd '\(escapedDir)' && \(headlessEnv)'\(escapedExec)'"
+            : "-u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE -u XDG_RUNTIME_DIR CI=true HEADLESS=true "
+        if let actionArchiveCache {
+            environment += "\(ActionArchiveCache.variable)='\(actionArchiveCache.replacingOccurrences(of: "'", with: "'\\''"))' "
+        }
+        let launch = "cd '\(escapedDir)' && \(environment.isEmpty ? "" : "env " + environment)'\(escapedExec)'"
         guard let jitConfigFile else { return launch }
         return JITRunner.launchPrelude(runnerDirectory: directory, configFile: jitConfigFile) + " && " + launch
     }
