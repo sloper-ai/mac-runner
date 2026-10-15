@@ -100,6 +100,46 @@ enum JITRunner {
         }
     }
 
+    // MARK: - Starts GitHub failed
+
+    /// The wait before retrying a start GitHub couldn't take, in seconds. It
+    /// doubles with each retry that fails the same way, up to `gitHubRetryMaxDelay`.
+    static let gitHubRetryFirstDelay = 10
+    /// The longest wait between those retries, and how often a login GitHub
+    /// refused is checked again, in seconds.
+    static let gitHubRetryMaxDelay = 300
+
+    /// What to do once a JIT runner's start has failed.
+    enum StartRetry: Equatable {
+        /// GitHub couldn't be reached, or failed on its side: start again in
+        /// `seconds`, for as long as that takes. No crash retries are used.
+        case retry(seconds: Int)
+        /// GitHub refused the login: stop, and check the login again every
+        /// `seconds`, starting once it works.
+        case waitForLogin(seconds: Int)
+        /// It wasn't GitHub: the usual crash backoff and retry limit apply.
+        case crashBackoff
+    }
+
+    /// - Parameter attempt: Which retry in a row of starts GitHub couldn't
+    ///   take this would be, from 1.
+    static func startRetry(after error: Error, attempt: Int) -> StartRetry {
+        switch (error as? GHError)?.failure {
+        case .transient?:
+            return .retry(seconds: gitHubRetryDelay(forAttempt: attempt))
+        case .unauthorized?:
+            return .waitForLogin(seconds: gitHubRetryMaxDelay)
+        case .other?, nil:
+            return .crashBackoff
+        }
+    }
+
+    /// 10s, 20s, 40s, … then 5 minutes for every retry after that.
+    static func gitHubRetryDelay(forAttempt attempt: Int) -> Int {
+        let doublings = min(max(attempt - 1, 0), 16)
+        return min(gitHubRetryFirstDelay << doublings, gitHubRetryMaxDelay)
+    }
+
     // MARK: - Process isolation
 
     /// Shell command, run before run.sh in the runner's directory, that gives

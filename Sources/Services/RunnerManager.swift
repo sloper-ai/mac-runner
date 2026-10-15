@@ -79,6 +79,9 @@ class RunnerManager: ObservableObject {
     /// Runners whose startRunner is still running (container starts take a while).
     private var startingRunnerIDs: Set<UUID> = []
     private var restartAttemptHistory: [UUID: [Date]] = [:]
+    /// JIT runners' retries in a row of a start GitHub couldn't take (see
+    /// `JITRunner.startRetry`); they're scheduled in `scheduledRestarts` too.
+    private var gitHubRetryAttempts: [UUID: Int] = [:]
     private var scheduledRestarts: [UUID: Task<Void, Never>] = [:]
     private var launchTokens: [UUID: UUID] = [:]
     private let restartWindowSeconds: TimeInterval = 600
@@ -478,7 +481,9 @@ class RunnerManager: ObservableObject {
         func restart(_ id: UUID) async {
             defer { autoRestartPendingIDs.remove(id) }
             let isJIT = runners.first(where: { $0.id == id })?.isJIT == true
-            if await RunnerStartupRecovery.failure(isJIT: isJIT, start: { try await self.startRunner(id) }) != nil {
+            if let error = await RunnerStartupRecovery.failure(isJIT: isJIT, start: { try await self.startRunner(id) }) {
+                // Started before the network was up, say: a JIT runner waits GitHub out.
+                if isJIT && waitForGitHub(id, after: error) { return }
                 if let index = runners.firstIndex(where: { $0.id == id }) {
                     runners[index].status = .error
                     saveConfiguration()
@@ -721,6 +726,7 @@ class RunnerManager: ObservableObject {
         scheduledRestarts[id]?.cancel()
         scheduledRestarts.removeValue(forKey: id)
         restartAttemptHistory.removeValue(forKey: id)
+        gitHubRetryAttempts.removeValue(forKey: id)
         pendingAutoPauses.removeValue(forKey: id)
         recentJobs.removeValue(forKey: id)
 
@@ -1082,6 +1088,7 @@ class RunnerManager: ObservableObject {
         }
         runners[index].storageBlockedReason = nil
         runners[index].status = .running
+        gitHubRetryAttempts.removeValue(forKey: id)
         saveConfiguration()
     }
 
@@ -1177,6 +1184,7 @@ class RunnerManager: ObservableObject {
         scheduledRestarts[id]?.cancel()
         scheduledRestarts.removeValue(forKey: id)
         restartAttemptHistory.removeValue(forKey: id)
+        gitHubRetryAttempts.removeValue(forKey: id)
         launchTokens.removeValue(forKey: id)
 
         if runner.isJIT {
@@ -1897,7 +1905,9 @@ class RunnerManager: ObservableObject {
     /// Fail early, before anything is removed, if a runner couldn't be registered.
     private func preflightRegistration(_ desired: DesiredRunner, settings: AppSettings) async throws {
         let auth = await ghService.validateAuth()
-        guard auth.isAuthenticated else { throw GHError.authFailed(auth.recoveryMessage) }
+        guard auth.isAuthenticated else {
+            throw auth.failure == .transient ? GHError.unavailable(auth.recoveryMessage) : GHError.authFailed(auth.recoveryMessage)
+        }
         guard try await ghService.validateTarget(desired.target) else { throw RunnerError.invalidRepo }
         if (desired.isolation ?? settings.isolationMode) == .container, desired.containerEngine == .docker {
             _ = try await DockerRunnerEngine.requireRunningDaemon()
@@ -2183,16 +2193,97 @@ class RunnerManager: ObservableObject {
         }
     }
 
-    /// A JIT runner's next start failed (GitHub unreachable for a moment, say):
-    /// retry with the crash backoff instead of giving up at once, since unlike
-    /// a long-lived runner it needs the API before every job.
+    /// A JIT runner's next start failed. Unlike a long-lived runner it needs
+    /// GitHub's API before every job, so an outage there mustn't use up its
+    /// crash retries: it waits GitHub out instead (see `waitForGitHub`). Other
+    /// failures get the crash backoff rather than giving up at once.
     private func retryJITStart(_ id: UUID, after error: Error) {
         guard let index = runners.firstIndex(where: { $0.id == id }) else { return }
+        if waitForGitHub(id, after: error) { return }
         let reason = "couldn't start the next single-use runner: \(error.localizedDescription)"
         if !scheduleAutoRestart(for: id, reason: reason, runnerIndex: index) {
             runners[index].status = .error
         }
         saveConfiguration()
+    }
+
+    /// When GitHub failed a JIT runner's start, schedule what
+    /// `JITRunner.startRetry` says: another start once the outage may be over,
+    /// or, for a login GitHub refused, an error and a check of the login every
+    /// few minutes. False when GitHub didn't cause the failure.
+    private func waitForGitHub(_ id: UUID, after error: Error) -> Bool {
+        guard let index = runners.firstIndex(where: { $0.id == id }) else { return true }
+        // A stop is underway: it deletes what's left, and nothing should start.
+        guard !manualStopRequests.contains(id) else { return true }
+        let attempt = gitHubRetryAttempts[id, default: 0] + 1
+        switch JITRunner.startRetry(after: error, attempt: attempt) {
+        case .crashBackoff:
+            return false
+        case .retry(let seconds):
+            gitHubRetryAttempts[id] = attempt
+            // Still wanted, as between jobs: a stop marks it stopped, which
+            // cancels the retry, and an app restarted meanwhile starts it.
+            runners[index].status = .running
+            runners[index].lastRestartEvent = "Waiting for GitHub: couldn't start the next single-use runner (\(error.localizedDescription)); retrying in \(seconds)s (attempt \(attempt))."
+            logRunnerEvent(for: runners[index], message: runners[index].lastRestartEvent ?? "")
+            saveConfiguration()
+            scheduleGitHubRetry(id, in: seconds, waitingForLogin: false)
+        case .waitForLogin(let seconds):
+            gitHubRetryAttempts.removeValue(forKey: id)
+            runners[index].status = .error
+            runners[index].lastRestartEvent = "Stopped: GitHub refused the login (\(error.localizedDescription)). Checking it again every \(seconds / 60) minutes."
+            logRunnerEvent(for: runners[index], message: runners[index].lastRestartEvent ?? "")
+            saveConfiguration()
+            scheduleGitHubRetry(id, in: seconds, waitingForLogin: true)
+        }
+        return true
+    }
+
+    private func scheduleGitHubRetry(_ id: UUID, in seconds: Int, waitingForLogin: Bool) {
+        scheduledRestarts[id]?.cancel()
+        scheduledRestarts[id] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            await self?.retryGitHubStart(id, waitingForLogin: waitingForLogin)
+        }
+    }
+
+    /// A retry `waitForGitHub` scheduled: start the runner unless it was
+    /// stopped, started, or removed meanwhile, here or in another process.
+    private func retryGitHubStart(_ id: UUID, waitingForLogin: Bool) async {
+        // Dropped from the table first, or startRunner cancels this task (see performScheduledRestart).
+        scheduledRestarts.removeValue(forKey: id)
+        reloadExternalConfigChanges()
+        guard let runner = runners.first(where: { $0.id == id }), runner.isJIT,
+              !manualStopRequests.contains(id),
+              runner.status == (waitingForLogin ? .error : .running) else { return }
+        // Taken before any await, so the JIT supervisor doesn't take the runner over meanwhile.
+        guard let startLock = RunnerStartLock.tryAcquire(for: id) else { return }  // another process is starting it
+        defer { startLock.unlock() }
+
+        if waitingForLogin {
+            // Checked quietly: the error said it's checked every few minutes.
+            let auth = await ghService.validateAuth()
+            guard auth.isAuthenticated else {
+                scheduleGitHubRetry(id, in: JITRunner.gitHubRetryMaxDelay, waitingForLogin: true)
+                return
+            }
+            reloadExternalConfigChanges()
+            guard runners.first(where: { $0.id == id })?.status == .error, !manualStopRequests.contains(id) else { return }
+        }
+
+        do {
+            try await startRunner(id, holdingStartLock: true)
+            if let index = runners.firstIndex(where: { $0.id == id }), runners[index].storageBlockedReason == nil {
+                runners[index].lastRestartEvent = "GitHub is back; started the next single-use runner."
+                logRunnerEvent(for: runners[index], message: runners[index].lastRestartEvent ?? "")
+                saveConfiguration()
+            }
+        } catch RunnerError.alreadyRunning {
+            // Another Mac Runner process started it meanwhile.
+        } catch {
+            retryJITStart(id, after: error)
+        }
     }
 
     /// Why a JIT runner whose job just ended should pause instead of taking
@@ -2789,6 +2880,11 @@ class RunnerManager: ObservableObject {
 
     private func validateGitHubAuth(for runner: Runner, operation: String) async throws {
         let authState = await ghService.validateAuth()
+        if authState.failure == .transient {
+            // Not known to be invalid, so the login's state stays as it was;
+            // whoever retries logs it.
+            throw GHError.unavailable(authState.recoveryMessage)
+        }
         guard authState.isAuthenticated else {
             gitHubAuthIssue = authState.recoveryMessage
             error = authState.recoveryMessage

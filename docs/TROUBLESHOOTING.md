@@ -269,6 +269,8 @@
 - GitHub CLI not authenticated
 - Token expired
 
+"Couldn't reach GitHub to check the GitHub CLI login" is a different problem: GitHub's API didn't answer, so the login may be fine. A JIT runner retries those on its own (see [Just-in-time Runners](../README.md#just-in-time-runners)); check the network or https://githubstatus.com.
+
 **Solutions:**
 1. **Re-authenticate:**
    ```bash

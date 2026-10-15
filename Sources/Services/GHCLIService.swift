@@ -14,10 +14,55 @@ struct ProcessResult: Sendable {
     let stderr: String
 }
 
+/// How a call to GitHub failed, for deciding whether to try it again.
+enum GitHubFailure: Sendable, Equatable {
+    /// GitHub couldn't be reached, or failed on its side (a 5xx, a rate
+    /// limit): the same call can work in a moment.
+    case transient
+    /// GitHub refused the token (401), or gh has none: someone has to log in.
+    case unauthorized
+    /// Anything else (a missing scope, a rejected request): trying the same
+    /// call again won't help.
+    case other
+
+    /// Classify a failed `gh api` call by its exit status and stderr.
+    /// (Not `gh auth status`'s output: it says the token is invalid whatever
+    /// went wrong, a refused connection included.)
+    static func classify(exitCode: Int32, stderr: String) -> GitHubFailure {
+        let message = stderr.lowercased()
+        // gh exits 4 when it has no token at all; GitHub answers 401 to one it refuses.
+        if exitCode == 4 || message.contains("(http 401)") || message.contains("gh: http 401") {
+            return .unauthorized
+        }
+        // gh prints "gh: <message> (HTTP <status>)", or "gh: HTTP <status>" for a body that isn't JSON.
+        if message.range(of: #"http 5\d\d\b"#, options: .regularExpression) != nil
+            || message.contains("http 429") || message.contains("rate limit") {
+            return .transient
+        }
+        if networkErrors.contains(where: message.contains) {
+            return .transient
+        }
+        return .other
+    }
+
+    /// What gh (Go's net/http) prints when it couldn't get an answer from GitHub.
+    private static let networkErrors = [
+        "dial tcp", "connection refused", "connection reset", "broken pipe",
+        "no such host", "error connecting to", "server misbehaving",
+        "network is unreachable", "network is down", "no route to host",
+        "timeout", "deadline exceeded", ": eof", "unexpected eof",
+    ]
+}
+
 struct GitHubAuthState: Sendable, Equatable {
     let isAuthenticated: Bool
+    /// Why it isn't authenticated: `.transient` when GitHub couldn't be
+    /// reached to check, else `.unauthorized`. nil when it is.
+    let failure: GitHubFailure?
     let statusMessage: String
     let recoveryMessage: String
+
+    static let loginRecoveryMessage = "GitHub authentication expired or is invalid. Run: gh auth login"
 
     static func fromProcessResult(exitCode: Int32, stdout: String, stderr: String) -> GitHubAuthState {
         let detail = stderr.isEmpty ? stdout : stderr
@@ -26,20 +71,51 @@ struct GitHubAuthState: Sendable, Equatable {
         if exitCode == 0 {
             return GitHubAuthState(
                 isAuthenticated: true,
+                failure: nil,
                 statusMessage: trimmedDetail.isEmpty ? "Authenticated with GitHub CLI." : trimmedDetail,
                 recoveryMessage: ""
             )
         }
 
-        let recoveryPrefix = "GitHub authentication expired or is invalid. Run: gh auth login"
         let recoveryMessage = trimmedDetail.isEmpty
-            ? recoveryPrefix
-            : "\(recoveryPrefix)\n\(trimmedDetail)"
+            ? loginRecoveryMessage
+            : "\(loginRecoveryMessage)\n\(trimmedDetail)"
 
         return GitHubAuthState(
             isAuthenticated: false,
+            failure: .unauthorized,
             statusMessage: trimmedDetail.isEmpty ? "gh CLI not found or not authenticated" : trimmedDetail,
             recoveryMessage: recoveryMessage
+        )
+    }
+
+    /// `gh auth status` failed. It says the token is invalid whatever went
+    /// wrong, so `probe`, a `gh api` call with the same token, tells an outage
+    /// from a login GitHub refuses. (nil when gh couldn't be run for it.)
+    static func fromFailedStatus(_ status: ProcessResult, probe: ProcessResult?) -> GitHubAuthState {
+        guard let probe else {
+            return fromProcessResult(exitCode: status.exitCode, stdout: status.stdout, stderr: status.stderr)
+        }
+        if probe.exitCode == 0 {
+            // GitHub takes the token (`gh auth status` can fail over another host or account).
+            return fromProcessResult(exitCode: 0, stdout: "", stderr: "")
+        }
+        guard GitHubFailure.classify(exitCode: probe.exitCode, stderr: probe.stderr) == .transient else {
+            let refused = fromProcessResult(exitCode: status.exitCode, stdout: status.stdout, stderr: status.stderr)
+            let answer = probe.stderr.isEmpty ? probe.stdout : probe.stderr
+            guard !answer.isEmpty else { return refused }
+            return GitHubAuthState(
+                isAuthenticated: false,
+                failure: .unauthorized,
+                statusMessage: refused.statusMessage,
+                recoveryMessage: "\(refused.recoveryMessage)\nGitHub answered: \(answer)"
+            )
+        }
+        return GitHubAuthState(
+            isAuthenticated: false,
+            failure: .transient,
+            statusMessage: "Couldn't reach GitHub to check the GitHub CLI login.",
+            recoveryMessage: "Couldn't reach GitHub to check the GitHub CLI login: \(probe.stderr)"
         )
     }
 }
@@ -148,16 +224,17 @@ final class GHCLIService: Sendable {
         guard let result = try? await runGH(["auth", "status"]) else {
             return GitHubAuthState(
                 isAuthenticated: false,
+                failure: .unauthorized,
                 statusMessage: "gh CLI not found or not authenticated",
-                recoveryMessage: "GitHub authentication expired or is invalid. Run: gh auth login"
+                recoveryMessage: GitHubAuthState.loginRecoveryMessage
             )
         }
-
-        return GitHubAuthState.fromProcessResult(
-            exitCode: result.exitCode,
-            stdout: result.stdout,
-            stderr: result.stderr
-        )
+        guard result.exitCode != 0 else {
+            return GitHubAuthState.fromProcessResult(exitCode: 0, stdout: result.stdout, stderr: result.stderr)
+        }
+        // rate_limit doesn't count against the rate limit, and answers 401 to a token GitHub refuses.
+        let probe = try? await runGH(["api", "rate_limit", "--silent"])
+        return GitHubAuthState.fromFailedStatus(result, probe: probe)
     }
 
     func checkAuth() async -> Bool {
@@ -348,7 +425,7 @@ final class GHCLIService: Sendable {
         ])
         guard result.exitCode == 0, !result.stdout.isEmpty else {
             let detail = Self.registrationTokenFailureMessage(from: result.stderr)
-            throw GHError.apiFailed("Failed to get registration token: \(detail)")
+            throw GHError.fromAPIResult("Failed to get registration token: \(detail)", result)
         }
         return result.stdout
     }
@@ -454,7 +531,7 @@ final class GHCLIService: Sendable {
         ))
         guard result.exitCode == 0 else {
             let detail = Self.registrationTokenFailureMessage(from: result.stderr)
-            throw GHError.apiFailed("Failed to register a JIT runner: \(detail)")
+            throw GHError.fromAPIResult("Failed to register a JIT runner: \(detail)", result)
         }
         guard let config = Self.decodeJITConfig(result.stdout) else {
             // Never quote the response: it holds the runner's credentials.
@@ -584,6 +661,33 @@ enum GHError: LocalizedError {
     case processLaunchFailed(String)
     case authFailed(String)
     case apiFailed(String)
+    /// GitHub couldn't be reached, or failed on its side: worth trying again.
+    case unavailable(String)
+
+    /// The error for a failed `gh api` call, by what GitHub answered.
+    /// `message` says what failed.
+    static func fromAPIResult(_ message: String, _ result: ProcessResult) -> GHError {
+        switch GitHubFailure.classify(exitCode: result.exitCode, stderr: result.stderr) {
+        case .transient:
+            return .unavailable(message)
+        case .unauthorized:
+            return .authFailed("\(message)\nRun: gh auth login")
+        case .other:
+            return .apiFailed(message)
+        }
+    }
+
+    /// How the call failed, for deciding whether to try it again.
+    var failure: GitHubFailure {
+        switch self {
+        case .unavailable:
+            return .transient
+        case .authFailed:
+            return .unauthorized
+        case .processLaunchFailed, .apiFailed:
+            return .other
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -591,7 +695,7 @@ enum GHError: LocalizedError {
             return "Failed to launch gh CLI: \(msg)"
         case .authFailed(let msg):
             return "GitHub authentication failed: \(msg)"
-        case .apiFailed(let msg):
+        case .apiFailed(let msg), .unavailable(let msg):
             return msg
         }
     }
