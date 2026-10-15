@@ -1,3 +1,10 @@
+# [1.29.0](https://github.com/sloper-ai/mac-runner/compare/v1.28.1...v1.29.0) (2026-10-15)
+
+
+### Features
+
+* share an action archive cache between a Mac's runners ([#14](https://github.com/sloper-ai/mac-runner/issues/14)) ([0c8bec2](https://github.com/sloper-ai/mac-runner/commit/0c8bec251317b618571a7b5b816966ab5e022b87))
+
 ## [1.28.1](https://github.com/sloper-ai/mac-runner/compare/v1.28.0...v1.28.1) (2026-10-15)
 
 
