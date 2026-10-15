@@ -1,3 +1,10 @@
+## [1.28.1](https://github.com/sloper-ai/mac-runner/compare/v1.28.0...v1.28.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* keep single-use runners retrying through GitHub outages ([#12](https://github.com/sloper-ai/mac-runner/issues/12)) ([d530e4e](https://github.com/sloper-ai/mac-runner/commit/d530e4e263d75f286f046e3e2153ec0a9de94460))
+
 # [1.28.0](https://github.com/sloper-ai/mac-runner/compare/v1.27.2...v1.28.0) (2026-10-11)
 
 
